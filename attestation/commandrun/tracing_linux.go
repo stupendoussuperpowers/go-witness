@@ -17,7 +17,9 @@
 package commandrun
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -33,7 +35,8 @@ import (
 )
 
 const (
-	MAX_PATH_LEN = 4096
+	MAX_PATH_LEN    = 4096
+	CGROUP_REDIRECT = "/sys/fs/cgroup/redirect"
 )
 
 type ptraceContext struct {
@@ -43,11 +46,26 @@ type ptraceContext struct {
 	exitCode            int
 	hash                []cryptoutil.DigestValue
 	environmentCapturer *environment.Capture
+	networkTrace        bool
 }
 
 func enableTracing(c *exec.Cmd) {
 	c.SysProcAttr = &unix.SysProcAttr{
 		Ptrace: true,
+	}
+}
+
+func enableNetwork(c *exec.Cmd) {
+	log.Infof("Running in a cgroup...\n")
+	cgroupFD, err := unix.Open(CGROUP_REDIRECT, unix.O_PATH, 0)
+	if err != nil {
+		log.Info("Couldn't run network tracing:", err)
+		return
+	}
+	c.SysProcAttr = &unix.SysProcAttr{
+		CgroupFD:    cgroupFD,
+		UseCgroupFD: true,
+		Ptrace:      true,
 	}
 }
 
@@ -58,6 +76,7 @@ func (r *CommandRun) trace(c *exec.Cmd, actx *attestation.AttestationContext) ([
 		processes:           make(map[int]*ProcessInfo),
 		hash:                actx.Hashes(),
 		environmentCapturer: actx.EnvironmentCapturer(),
+		networkTrace:        r.NetworkEnabled(),
 	}
 
 	if err := pctx.runTrace(); err != nil {
@@ -76,7 +95,7 @@ func (r *CommandRun) trace(c *exec.Cmd, actx *attestation.AttestationContext) ([
 func (p *ptraceContext) runTrace() error {
 	defer p.retryOpenedFiles()
 
-	runtime.LockOSThread()
+	// runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	status := unix.WaitStatus(0)
 	_, err := unix.Wait4(p.parentPid, &status, 0, nil)
@@ -85,13 +104,13 @@ func (p *ptraceContext) runTrace() error {
 	}
 
 	if err := unix.PtraceSetOptions(p.parentPid, unix.PTRACE_O_TRACESYSGOOD|unix.PTRACE_O_TRACEEXEC|unix.PTRACE_O_TRACEEXIT|unix.PTRACE_O_TRACEVFORK|unix.PTRACE_O_TRACEFORK|unix.PTRACE_O_TRACECLONE); err != nil {
-		return err
+		return fmt.Errorf("105:%w. ptraceContext: %v", err, p)
 	}
 
 	procInfo := p.getProcInfo(p.parentPid)
 	procInfo.Program = p.mainProgram
 	if err := unix.PtraceSyscall(p.parentPid, 0); err != nil {
-		return err
+		return fmt.Errorf("111:%w", err)
 	}
 
 	for {
@@ -270,7 +289,35 @@ func (ctx *ptraceContext) procInfoArray() []ProcessInfo {
 		processes = append(processes, *procInfo)
 	}
 
+	if ctx.networkTrace {
+		getNetworkInfo(processes)
+	}
+
 	return processes
+}
+
+func getNetworkInfo(processes []ProcessInfo) {
+	for i := range processes {
+		proc := &processes[i]
+		proc.NetworkCalls = make([]NetworkCall, 0)
+
+		file, err := os.Open(fmt.Sprintf("/tmp/tls.%d", proc.ProcessID))
+		if err != nil {
+			log.Debugf("(network) PID %d appears to have made no network calls.\n", proc.ProcessID)
+			continue
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			var call NetworkCall
+			line := scanner.Bytes()
+			if err := json.Unmarshal(line, &call); err != nil {
+				log.Infof("Invalid network call log: %v", err)
+			}
+			proc.NetworkCalls = append(proc.NetworkCalls, call)
+		}
+	}
 }
 
 func (ctx *ptraceContext) readSyscallReg(pid int, addr uintptr, n int) (string, error) {

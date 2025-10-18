@@ -26,6 +26,9 @@ import (
 func enableTracing(c *exec.Cmd) {
 }
 
+func enableNetwork(c *exec.Cmd) {
+}
+
 func (rc *CommandRun) trace(c *exec.Cmd, actx *attestation.AttestationContext) ([]ProcessInfo, error) {
 	return nil, errors.New("tracing not supported on this platform")
 }

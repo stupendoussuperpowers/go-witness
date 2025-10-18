@@ -16,9 +16,12 @@ package commandrun
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
+	"time"
 
 	"github.com/in-toto/go-witness/attestation"
 	"github.com/in-toto/go-witness/cryptoutil"
@@ -73,6 +76,12 @@ func WithTracing(enabled bool) Option {
 	}
 }
 
+func WithNetwork(enabled bool) Option {
+	return func(cr *CommandRun) {
+		cr.traceNetwork = enabled
+	}
+}
+
 func WithSilent(silent bool) Option {
 	return func(cr *CommandRun) {
 		cr.silent = silent
@@ -89,6 +98,15 @@ func New(opts ...Option) *CommandRun {
 	return cr
 }
 
+type NetworkCall struct {
+	Timestamp string          `json:"timestamp"`
+	Duration  time.Duration   `json:"duration"`
+	Protocol  string          `json:"protocol"`
+	SrcAddr   string          `json:"src_addr"`
+	DstAddr   string          `json:"dst_addr"`
+	Data      json.RawMessage `json:"data"`
+}
+
 type ProcessInfo struct {
 	Program          string                          `json:"program,omitempty"`
 	ProcessID        int                             `json:"processid"`
@@ -100,6 +118,7 @@ type ProcessInfo struct {
 	OpenedFiles      map[string]cryptoutil.DigestSet `json:"openedfiles,omitempty"`
 	Environ          string                          `json:"environ,omitempty"`
 	SpecBypassIsVuln bool                            `json:"specbypassisvuln,omitempty"`
+	NetworkCalls     []NetworkCall                   `json:"networkcalls,omitempty"`
 }
 
 type CommandRun struct {
@@ -112,6 +131,7 @@ type CommandRun struct {
 	silent        bool
 	materials     map[string]cryptoutil.DigestSet
 	enableTracing bool
+	traceNetwork  bool
 }
 
 func (a *CommandRun) Schema() *jsonschema.Schema {
@@ -154,6 +174,10 @@ func (rc *CommandRun) TracingEnabled() bool {
 	return rc.enableTracing
 }
 
+func (rc *CommandRun) NetworkEnabled() bool {
+	return rc.traceNetwork
+}
+
 func (r *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 	c := exec.Command(r.Cmd[0], r.Cmd[1:]...)
 	c.Dir = ctx.WorkingDir()
@@ -179,12 +203,17 @@ func (r *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 		enableTracing(c)
 	}
 
+	if r.traceNetwork {
+		enableNetwork(c)
+	}
+
+	runtime.LockOSThread()
 	if err := c.Start(); err != nil {
 		return err
 	}
 
 	var err error
-	if r.enableTracing {
+	if r.enableTracing || r.traceNetwork {
 		r.Processes, err = r.trace(c, ctx)
 	} else {
 		err = c.Wait()
