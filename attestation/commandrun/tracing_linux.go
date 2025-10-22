@@ -104,13 +104,13 @@ func (p *ptraceContext) runTrace() error {
 	}
 
 	if err := unix.PtraceSetOptions(p.parentPid, unix.PTRACE_O_TRACESYSGOOD|unix.PTRACE_O_TRACEEXEC|unix.PTRACE_O_TRACEEXIT|unix.PTRACE_O_TRACEVFORK|unix.PTRACE_O_TRACEFORK|unix.PTRACE_O_TRACECLONE); err != nil {
-		return fmt.Errorf("105:%w. ptraceContext: %v", err, p)
+		return err
 	}
 
 	procInfo := p.getProcInfo(p.parentPid)
 	procInfo.Program = p.mainProgram
 	if err := unix.PtraceSyscall(p.parentPid, 0); err != nil {
-		return fmt.Errorf("111:%w", err)
+		return err
 	}
 
 	for {
