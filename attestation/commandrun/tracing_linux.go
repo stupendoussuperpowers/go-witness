@@ -30,7 +30,9 @@ import (
 	"github.com/in-toto/go-witness/attestation"
 	"github.com/in-toto/go-witness/cryptoutil"
 	"github.com/in-toto/go-witness/environment"
+	"github.com/in-toto/go-witness/internal/witnessd"
 	"github.com/in-toto/go-witness/log"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -56,6 +58,11 @@ func enableTracing(c *exec.Cmd) {
 }
 
 func enableNetwork(c *exec.Cmd) {
+	if err := witnessd.Launch(); err != nil {
+		log.Info("Could not launch witnessd. Skipping network tracing: %v", err)
+		return
+	}
+
 	log.Infof("Running in a cgroup...\n")
 	cgroupFD, err := unix.Open(CGROUP_REDIRECT, unix.O_PATH, 0)
 	if err != nil {
