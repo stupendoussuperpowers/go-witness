@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/in-toto/go-witness/log"
 	"golang.org/x/sys/unix"
@@ -52,6 +53,8 @@ func Launch() error {
 		log.Infof("Failed to start daemon: %v", err)
 		return err
 	}
+
+	time.Sleep(5 * time.Second)
 
 	return nil
 }
