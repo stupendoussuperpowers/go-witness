@@ -12,7 +12,7 @@ import (
 )
 
 const PIDFILE = "/var/witnessd.pid"
-const WITNESSD_PATH = "/usr/local/bin/witnessd"
+const WITNESSD_PATH = "witnessd"
 
 func isRunning() bool {
 	data, err := os.ReadFile(PIDFILE)
@@ -34,8 +34,7 @@ func Launch() error {
 
 	outputFile, err := os.OpenFile("/var/log/witnessd.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Errorf("Error creating log file:%v", err)
-		log.Infof("EUID: %d", os.Geteuid())
+		log.Errorf("Error creating witnessd og file:%v", err)
 		return err
 	}
 	defer outputFile.Close()
@@ -50,11 +49,11 @@ func Launch() error {
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Infof("Failed to start daemon: %v", err)
+		log.Infof("Failed to start witnessd: %v", err)
 		return err
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(time.Second)
 
 	return nil
 }
