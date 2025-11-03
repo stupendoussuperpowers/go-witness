@@ -39,6 +39,36 @@
       },
       "type": "object"
     },
+    "NetworkCall": {
+      "properties": {
+        "timestamp": {
+          "type": "string"
+        },
+        "duration": {
+          "type": "integer"
+        },
+        "protocol": {
+          "type": "string"
+        },
+        "src_addr": {
+          "type": "string"
+        },
+        "dst_addr": {
+          "type": "string"
+        },
+        "data": true
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "timestamp",
+        "duration",
+        "protocol",
+        "src_addr",
+        "dst_addr",
+        "data"
+      ]
+    },
     "ProcessInfo": {
       "properties": {
         "program": {
@@ -73,6 +103,12 @@
         },
         "specbypassisvuln": {
           "type": "boolean"
+        },
+        "networkcalls": {
+          "items": {
+            "$ref": "#/$defs/NetworkCall"
+          },
+          "type": "array"
         }
       },
       "additionalProperties": false,
