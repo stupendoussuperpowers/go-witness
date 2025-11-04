@@ -17,7 +17,6 @@
 package commandrun
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
