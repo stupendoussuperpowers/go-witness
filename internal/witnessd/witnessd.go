@@ -1,9 +1,13 @@
 package witnessd
 
 import (
+	"bufio"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,6 +17,7 @@ import (
 
 const PIDFILE = "/var/witnessd.pid"
 const WITNESSD_PATH = "witnessd"
+const SOCKET_PATH = "/var/witnessd.sock"
 
 func isRunning() bool {
 	data, err := os.ReadFile(PIDFILE)
@@ -56,4 +61,35 @@ func Launch() error {
 	time.Sleep(time.Second)
 
 	return nil
+}
+
+func GetLogs(pid int) ([]string, error) {
+	conn, err := net.Dial("unix", SOCKET_PATH)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Write([]byte(fmt.Sprintf("GET %d\n", pid)))
+	if err != nil {
+		return nil, err
+	}
+
+	var output []string
+
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if strings.HasPrefix(line, "END") {
+			break
+		}
+		if strings.HasPrefix(line, "ERROR") {
+			return nil, fmt.Errorf("witnessd error: %s", line)
+		}
+
+		output = append(output, line)
+	}
+
+	return output, nil
 }

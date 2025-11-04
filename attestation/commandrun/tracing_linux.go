@@ -102,7 +102,7 @@ func (r *CommandRun) trace(c *exec.Cmd, actx *attestation.AttestationContext) ([
 func (p *ptraceContext) runTrace() error {
 	defer p.retryOpenedFiles()
 
-	// runtime.LockOSThread()
+	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	status := unix.WaitStatus(0)
 	_, err := unix.Wait4(p.parentPid, &status, 0, nil)
@@ -119,7 +119,7 @@ func (p *ptraceContext) runTrace() error {
 	if err := unix.PtraceSyscall(p.parentPid, 0); err != nil {
 		return err
 	}
-
+	log.Infof("procInfo: %v", procInfo)
 	for {
 		pid, err := unix.Wait4(-1, &status, unix.WALL, nil)
 		if err != nil {
@@ -308,22 +308,19 @@ func getNetworkInfo(processes []ProcessInfo) {
 		proc := &processes[i]
 		proc.NetworkCalls = make([]NetworkCall, 0)
 
-		file, err := os.Open(fmt.Sprintf("/tmp/tls.%d", proc.ProcessID))
+		logs, err := witnessd.GetLogs(proc.ProcessID)
 		if err != nil {
-			log.Debugf("(network) PID %d appears to have made no network calls.\n", proc.ProcessID)
+			log.Debugf("(network) PID %d has invalid or no logs: %v\n", proc.ProcessID, err)
 			continue
 		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
+		for _, pkt := range logs {
 			var call NetworkCall
-			line := scanner.Bytes()
-			if err := json.Unmarshal(line, &call); err != nil {
-				log.Infof("Invalid network call log: %v", err)
+			if err := json.Unmarshal([]byte(pkt), &call); err != nil {
+				log.Infof("Invalid network call: %v", err)
 			}
 			proc.NetworkCalls = append(proc.NetworkCalls, call)
 		}
+
 	}
 }
 
