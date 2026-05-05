@@ -241,6 +241,12 @@ func (p *ptraceContext) waitForExitOnly() error {
 
 			if sig == unix.SIGTRAP {
 				eventCode := (uint32(status) >> 16) & 0xFFFF
+				// In hooks-only mode, do not deliver SIGTRAP to the tracee. The initial ptrace
+				// stop after exec (and other non-event traps) show up as SIGTRAP with eventCode == 0,
+				// and injecting SIGTRAP can terminate the tracee before it runs.
+				if eventCode == 0 {
+					injectedSig = 0
+				}
 
 				if eventCode != 0 {
 					// Ptrace Event (EXIT) -> Swallow signal
