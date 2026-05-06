@@ -23,6 +23,9 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 test: ## Run the go unit tests
 	go test -v -coverprofile=profile.cov -covermode=atomic ./...
 
+integration-test:
+	go test -v -coverprofile=profile.cov -covermode=atomic -tags=integration ./...
+
 .PHONY: schema
 schema: ## Generate the attestor schema json files
 	docker run -v ./:/app -w /app --platform linux/amd64 cgr.dev/chainguard/go run ./schemagen/schema.go
@@ -49,6 +52,11 @@ generate-vmlinux: ## Generate vmlinux.h from kernel BTF (requires bpftool)
 generate-bpf: generate-vmlinux ## Generate BPF bytecode and Go bindings for network trace attestor
 	@echo "Generating BPF code (requires clang and llvm)..."
 	go generate ./attestation/networktrace/bpf/...
+
+.PHONY: generate-commandrun-bpf
+generate-commandrun-bpf: ## Generate BPF bytecode and Go bindings for command-run file tracing
+	@echo "Generating command-run BPF code (requires clang and llvm)..."
+	go generate ./attestation/commandrun/bpf/...
 
 .PHONY: generate-bpf-debug
 generate-bpf-debug: generate-vmlinux ## Generate BPF bytecode with debug logging enabled

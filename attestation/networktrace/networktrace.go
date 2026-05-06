@@ -18,6 +18,10 @@ package networktrace
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -33,6 +37,10 @@ const (
 	Name    = "network-trace"
 	Type    = "https://witness.dev/attestations/network-trace/v0.1"
 	RunType = attestation.ExecuteRunType
+
+	// Hardcoded cgroup for network-trace interception.
+	// The attestor will attach eBPF programs here and move the tracee into it in PreExec.
+	networkTraceCgroupPath = "/sys/fs/cgroup/witness-nettrace"
 )
 
 var (
@@ -68,6 +76,12 @@ type Attestor struct {
 	attestation Attestation
 
 	hooks *attestation.ExecuteHooks
+}
+
+// MarshalJSON ensures the exported attestation contains the recorded network trace,
+// not the attestor's internal (unexported) state.
+func (n *Attestor) MarshalJSON() ([]byte, error) {
+	return json.Marshal(n.attestation)
 }
 
 func (n *Attestor) DeclareHooks(hooks *attestation.ExecuteHooks) error {
@@ -153,8 +167,12 @@ func (n *Attestor) Attest(ctx *attestation.AttestationContext) error {
 
 // initBPF loads BPF programs and returns maps with a cleanup function
 func (n *Attestor) initBPF() (*bpf.Maps, func(), error) {
+	if err := os.MkdirAll(networkTraceCgroupPath, 0755); err != nil {
+		return nil, nil, err
+	}
+
 	bpfConfig := bpf.LoadConfig{
-		CgroupPath: "/sys/fs/cgroup", // TODO: allow user to configure
+		CgroupPath: networkTraceCgroupPath,
 		ProxyPort:  n.config.ProxyPort,
 		ProxyIPv4:  n.config.ProxyBindIPv4,
 	}
@@ -231,6 +249,14 @@ func (n *Attestor) registerHooks(bpfMaps *bpf.Maps, runtime *proxyRuntime) error
 	// PreExec: called when command starts, adds PID to BPF filter
 	r1, err := n.hooks.RegisterHook(attestation.StagePreExec, Name, func(pid int) error {
 		log.Debugf("[networktrace] PreExec hook triggered, tracking PID=%d", pid)
+
+		// Move the tracee into the dedicated cgroup before it is continued.
+		// In hooks-only mode, the tracee is ptrace-stopped here, so this happens before user code runs.
+		if err := os.WriteFile(filepath.Join(networkTraceCgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0); err != nil {
+			log.Errorf("[networktrace] failed to move pid %d into cgroup %s: %v", pid, networkTraceCgroupPath, err)
+			return err
+		}
+
 		n.config.ObservePIDs = append(n.config.ObservePIDs, uint32(pid))
 		n.attestation.StartTime = time.Now()
 		n.attestation.Config = n.config

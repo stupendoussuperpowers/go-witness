@@ -1,4 +1,4 @@
-// Copyright 2021 The Witness Contributors
+// Copyright 2026 The Witness Contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,25 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux && amd64
+//go:build linux
 
-package commandrun
+package bpf
 
-import (
-	"golang.org/x/sys/unix"
-)
-
-func getSyscallId(regs unix.PtraceRegs) uint64 {
-	return regs.Orig_rax
-}
-
-func getSyscallArgs(regs unix.PtraceRegs) []uintptr {
-	return []uintptr{
-		uintptr(regs.Rdi),
-		uintptr(regs.Rsi),
-		uintptr(regs.Rdx),
-		uintptr(regs.R10),
-		uintptr(regs.R8),
-		uintptr(regs.R9),
-	}
-}
+//go:generate sh -c "go tool bpf2go -cc clang -target bpfel,bpfeb -go-package bpf filetrace filetrace.bpf.c -- -Wall -Werror"

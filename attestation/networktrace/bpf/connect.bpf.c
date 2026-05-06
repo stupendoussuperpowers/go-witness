@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build ignore
+// go:build ignore
 
 #include "headers/vmlinux.h"
 #include <bpf/bpf_core_read.h>
@@ -28,138 +28,156 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 volatile const __u32 proxy_port = PROXY_PORT_TCP;
 volatile const __u32 proxy_ip = PROXY_IP;
-volatile const __u32 host_netns_inum = 0;  // to be set from user-space
+volatile const __u32 host_netns_inum = 0; // to be set from user-space
 
 SEC("cgroup/connect4")
-int intercept_connect4(struct bpf_sock_addr* ctx) {
-    // Only intercept TCP (SOCK_STREAM)
-    if (ctx->type != SOCK_STREAM) {
-        return 1;  // Allow UDP, raw, etc. to proceed without redirect
-    }
+int intercept_connect4(struct bpf_sock_addr *ctx) {
+	// Only intercept TCP (SOCK_STREAM)
+	if (ctx->type != SOCK_STREAM) {
+		return 1; // Allow UDP, raw, etc. to proceed without redirect
+	}
 
-    __u64 cookie = bpf_get_socket_cookie(ctx);
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    __u64 cgroup_id = bpf_get_current_cgroup_id();
+	__u64 cookie = bpf_get_socket_cookie(ctx);
+	__u32 pid = bpf_get_current_pid_tgid() >> 32;
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
 
-    char comm[MAX_COMM_LEN];
-    bpf_get_current_comm(&comm, sizeof(comm));
+	char comm[MAX_COMM_LEN];
+	bpf_get_current_comm(&comm, sizeof(comm));
 
-    int should_intercept_result = should_intercept(pid, cgroup_id, comm);
+	int should_intercept_result = should_intercept(pid, cgroup_id, comm);
 
-    if (!should_intercept_result) {
-        return 1;
-    }
+	if (!should_intercept_result) {
+		return 1;
+	}
 
-    __u16 dest_port = bpf_ntohs(ctx->user_port);
-    __u32 dest_ip = ctx->user_ip4;
+	__u16 dest_port = bpf_ntohs(ctx->user_port);
+	__u32 dest_ip = ctx->user_ip4;
 
-    struct task_struct* task = (struct task_struct*)bpf_get_current_task();
-    __u32 netns_inum = get_netns_inum(task);
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	__u32 netns_inum = get_netns_inum(task);
 
-    if (netns_inum != host_netns_inum) {
-        // Not in host netns, skip interception
-        DEBUG_LOG("connect4: SKIP diff-netns pid=%d comm=%s", pid, comm);
-        return 1;
-    }
+	if (netns_inum != host_netns_inum) {
+		// Not in host netns, skip interception
+		DEBUG_LOG("connect4: SKIP diff-netns pid=%d comm=%s", pid,
+			  comm);
+		return 1;
+	}
 
-    if (dest_port == 53) {
-        // DNS traffic - skip interception but log in debug mode
-        DEBUG_LOG("connect4: SKIP DNS pid=%d comm=%s", pid, comm);
-        return 1;
-    }
+	if (dest_port == 53) {
+		// DNS traffic - skip interception but log in debug mode
+		DEBUG_LOG("connect4: SKIP DNS pid=%d comm=%s", pid, comm);
+		return 1;
+	}
 
-    struct orig_dst_key orig_key = {.sock_cookie = cookie};
-    struct orig_dst_val orig_val = {
-        .orig_ip = dest_ip,
-        .orig_port = dest_port,
-        .cgroup_id = cgroup_id,
-        .pid = pid,
-    };
-    __builtin_memcpy(orig_val.comm, comm, MAX_COMM_LEN);
+	struct orig_dst_key orig_key = {.sock_cookie = cookie};
+	struct orig_dst_val orig_val = {
+	    .orig_ip = dest_ip,
+	    .orig_port = dest_port,
+	    .cgroup_id = cgroup_id,
+	    .pid = pid,
+	};
+	__builtin_memcpy(orig_val.comm, comm, MAX_COMM_LEN);
 
-    int ret = bpf_map_update_elem(&orig_dst_map, &orig_key, &orig_val, BPF_ANY);
-    if (ret < 0) {
-        LOG("connect4: ERROR map_update pid=%d ret=%d", pid, ret);
-        return 1;
-    }
+	int ret =
+	    bpf_map_update_elem(&orig_dst_map, &orig_key, &orig_val, BPF_ANY);
+	if (ret < 0) {
+		LOG("connect4: ERROR map_update pid=%d ret=%d", pid, ret);
+		return 1;
+	}
 
-    // Redirect to local proxy (using volatile variables set by userspace)
-    ctx->user_ip4 = bpf_htonl(proxy_ip);
-    ctx->user_port = bpf_htons(proxy_port);
+	// Redirect to local proxy (using volatile variables set by userspace)
+	ctx->user_ip4 = bpf_htonl(proxy_ip);
+	ctx->user_port = bpf_htons(proxy_port);
 
-    LOG("connect4: INTERCEPT pid=%d comm=%s dst=%x:%d", pid, comm, dest_ip,
-        dest_port);
+	LOG("connect4: INTERCEPT pid=%d comm=%s dst=%x:%d", pid, comm, dest_ip,
+	    dest_port);
 
-    return 1;
+	return 1;
 }
 
 SEC("cgroup/connect6")
-int intercept_connect6(struct bpf_sock_addr* ctx) {
-    // Only intercept TCP (SOCK_STREAM)
-    if (ctx->type != SOCK_STREAM) {
-        return 1;  // Allow UDP, raw, etc. to proceed without redirect
-    }
+int intercept_connect6(struct bpf_sock_addr *ctx) {
+	// Only intercept TCP (SOCK_STREAM)
+	if (ctx->type != SOCK_STREAM) {
+		return 1; // Allow UDP, raw, etc. to proceed without redirect
+	}
 
-    __u64 cookie = bpf_get_socket_cookie(ctx);
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    __u64 cgroup_id = bpf_get_current_cgroup_id();
+	__u64 cookie = bpf_get_socket_cookie(ctx);
+	__u32 pid = bpf_get_current_pid_tgid() >> 32;
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
 
-    char comm[MAX_COMM_LEN];
-    bpf_get_current_comm(&comm, sizeof(comm));
+	char comm[MAX_COMM_LEN];
+	bpf_get_current_comm(&comm, sizeof(comm));
 
-    int should_intercept_result = should_intercept(pid, cgroup_id, comm);
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-    if (!should_intercept_result) {
-        return 1;
-    }
+	truct pid *pid_struct = NULL;
+	bpf_core_read(&pid_struct, sizeof(pid_struct), &task->thread_pid);
+	if (!pid_struct)
+		return 1;
 
-    __u16 dest_port = bpf_ntohs(ctx->user_port);
+	unsigned int level = 0;
+	bpf_core_read(&level, sizeof(level), &pid_struct->level);
 
-    struct task_struct* task = (struct task_struct*)bpf_get_current_task();
-    __u32 netns_inum = get_netns_inum(task);
+	struct upid upid_entry = {};
+	bpf_core_read(&upid_entry, sizeof(upid_entry),
+		      &pid_struct->numbers[level]);
 
-    if (netns_inum != host_netns_inum) {
-        // Not in host netns, skip interception
-        DEBUG_LOG("connect6: SKIP diff-netns pid=%d comm=%s", pid, comm);
-        return 1;
-    }
+	int pid_ns = upid_entry.nr;
 
-    if (dest_port == 53) {
-        // DNS traffic - skip interception but log in debug mode
-        DEBUG_LOG("connect6: SKIP DNS pid=%d comm=%s", pid, comm);
-        return 1;  // Allow DNS to proceed unintercepted (no redirection)
-    }
+	int should_intercept_result = should_intercept(pid_ns, cgroup_id, comm);
 
-    struct orig_dst_key_v6 orig_key = {.sock_cookie = cookie};
-    struct orig_dst_val_v6 orig_val = {
-        .orig_port = dest_port,
-        .cgroup_id = cgroup_id,
-        .pid = pid,
-    };
+	if (should_intercept_result) {
+		return 1;
+	}
 
-    // Copy IPv6 address - manual unroll to make bpf verifier happy
-    ((__u32*)orig_val.orig_ip)[0] = ctx->user_ip6[0];
-    ((__u32*)orig_val.orig_ip)[1] = ctx->user_ip6[1];
-    ((__u32*)orig_val.orig_ip)[2] = ctx->user_ip6[2];
-    ((__u32*)orig_val.orig_ip)[3] = ctx->user_ip6[3];
+	__u16 dest_port = bpf_ntohs(ctx->user_port);
 
-    __builtin_memcpy(orig_val.comm, comm, MAX_COMM_LEN);
+	__u32 netns_inum = get_netns_inum(task);
 
-    int ret =
-        bpf_map_update_elem(&orig_dst_map_v6, &orig_key, &orig_val, BPF_ANY);
-    if (ret < 0) {
-        LOG("connect6: ERROR map_update pid=%d ret=%d", pid, ret);
-        return 1;
-    }
+	if (netns_inum != host_netns_inum) {
+		// Not in host netns, skip interception
+		DEBUG_LOG("connect6: SKIP diff-netns pid=%d comm=%s", pid,
+			  comm);
+		return 1;
+	}
 
-    // Redirect to local proxy (IPv6 loopback ::1)
-    ctx->user_ip6[0] = 0;
-    ctx->user_ip6[1] = 0;
-    ctx->user_ip6[2] = 0;
-    ctx->user_ip6[3] = bpf_htonl(1);  // ::1 in network byte order
-    ctx->user_port = bpf_htons(proxy_port);
+	if (dest_port == 53) {
+		// DNS traffic - skip interception but log in debug mode
+		DEBUG_LOG("connect6: SKIP DNS pid=%d comm=%s", pid, comm);
+		return 1; // Allow DNS to proceed unintercepted (no redirection)
+	}
 
-    LOG("connect6: INTERCEPT pid=%d comm=%s port=%d", pid, comm, dest_port);
+	struct orig_dst_key_v6 orig_key = {.sock_cookie = cookie};
+	struct orig_dst_val_v6 orig_val = {
+	    .orig_port = dest_port,
+	    .cgroup_id = cgroup_id,
+	    .pid = pid,
+	};
 
-    return 1;
+	// Copy IPv6 address - manual unroll to make bpf verifier happy
+	((__u32 *)orig_val.orig_ip)[0] = ctx->user_ip6[0];
+	((__u32 *)orig_val.orig_ip)[1] = ctx->user_ip6[1];
+	((__u32 *)orig_val.orig_ip)[2] = ctx->user_ip6[2];
+	((__u32 *)orig_val.orig_ip)[3] = ctx->user_ip6[3];
+
+	__builtin_memcpy(orig_val.comm, comm, MAX_COMM_LEN);
+
+	int ret = bpf_map_update_elem(&orig_dst_map_v6, &orig_key, &orig_val,
+				      BPF_ANY);
+	if (ret < 0) {
+		LOG("connect6: ERROR map_update pid=%d ret=%d", pid, ret);
+		return 1;
+	}
+
+	// Redirect to local proxy (IPv6 loopback ::1)
+	ctx->user_ip6[0] = 0;
+	ctx->user_ip6[1] = 0;
+	ctx->user_ip6[2] = 0;
+	ctx->user_ip6[3] = bpf_htonl(1); // ::1 in network byte order
+	ctx->user_port = bpf_htons(proxy_port);
+
+	LOG("connect6: INTERCEPT pid=%d comm=%s port=%d", pid, comm, dest_port);
+
+	return 1;
 }

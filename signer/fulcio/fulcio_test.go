@@ -40,14 +40,13 @@ import (
 
 	"path/filepath"
 
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	fulciopb "github.com/sigstore/fulcio/pkg/generated/protobuf"
 	"github.com/stretchr/testify/require"
-	"go.step.sm/crypto/jose"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	"github.com/go-jose/go-jose/v3/jwt"
 )
 
 func setupFulcioTestService(t *testing.T) (*dummyCAClientService, string) {
@@ -63,9 +62,14 @@ func setupFulcioTestService(t *testing.T) (*dummyCAClientService, string) {
 		t.Fatalf("failed to create client: %v", err)
 	}
 	service.client = client
+
+	t.Cleanup(func() {
+		service.server.Stop()
+	})
+
 	go func() {
 		if err := service.server.Serve(lis); err != nil {
-			log.Fatalf("failed to serve: %v", err)
+			t.Logf("failed to serve: %v", err)
 		}
 	}()
 	return service, fmt.Sprintf("localhost:%d", lis.Addr().(*net.TCPAddr).Port)
@@ -153,8 +157,11 @@ func generateTestToken(email string, subject string) string {
 		Subject string `json:"sub"`
 	}
 
-	key := []byte("test-secret")
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: key}, nil)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -170,7 +177,7 @@ func generateTestToken(email string, subject string) string {
 	claims.Audience = []string{"sigstore"}
 
 	builder := jwt.Signed(signer).Claims(claims)
-	signedToken, _ := builder.CompactSerialize()
+	signedToken, _ := builder.Serialize()
 
 	return signedToken
 }
@@ -218,8 +225,7 @@ func TestGetCert(t *testing.T) {
 
 func TestSigner(t *testing.T) {
 	// Setup dummy CA client service
-	service, url := setupFulcioTestService(t)
-	defer service.server.Stop()
+	_, url := setupFulcioTestService(t)
 
 	ctx := context.Background()
 
@@ -242,15 +248,12 @@ func TestSigner(t *testing.T) {
 	//this should be a tranport err since we cant actually test on 443 which is the default
 	require.ErrorContains(t, err, "lookup test")
 
-	// Test signer with token read from file
-	// NOTE: this function could be refactored to accept a fileSystem or io.Reader so reading the file can be mocked,
-	// but unsure if this is the way we want to go for now
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get working directory: %v", err)
+	// Test signer with token read from file using a dynamically generated temp token
+	tmpDir := t.TempDir()
+	tp := filepath.Join(tmpDir, "test.token")
+	if err := os.WriteFile(tp, []byte(generateTestToken("file@example.com", "")), 0600); err != nil {
+		t.Fatalf("failed to write temp token file: %v", err)
 	}
-	rootDir := filepath.Dir(filepath.Dir(wd))
-	tp := filepath.Join(rootDir, "hack", "test.token")
 
 	provider = New(WithFulcioURL(fmt.Sprintf("http://%v:%v", hostname, port)), WithTokenPath(tp))
 	_, err = provider.Signer(ctx)
@@ -432,9 +435,14 @@ func setupRetryFulcioTestService(t *testing.T, maxFailures int32) (*retryCAClien
 		t.Fatalf("failed to create client: %v", err)
 	}
 	service.client = client
+
+	t.Cleanup(func() {
+		service.server.Stop()
+	})
+
 	go func() {
 		if err := service.server.Serve(lis); err != nil {
-			log.Fatalf("failed to serve: %v", err)
+			t.Logf("failed to serve: %v", err)
 		}
 	}()
 	return service, fmt.Sprintf("localhost:%d", lis.Addr().(*net.TCPAddr).Port)
@@ -446,7 +454,6 @@ func TestGetCertRetryLogic(t *testing.T) {
 	t.Run("successful retry after transient failure", func(t *testing.T) {
 		// Setup service that fails first 2 attempts, succeeds on 3rd
 		service, _ := setupRetryFulcioTestService(t, 2)
-		defer service.server.Stop()
 
 		key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 		require.NoError(t, err)
@@ -467,7 +474,6 @@ func TestGetCertRetryLogic(t *testing.T) {
 	t.Run("max retries exceeded", func(t *testing.T) {
 		// Setup service that always fails
 		service, _ := setupRetryFulcioTestService(t, 5)
-		defer service.server.Stop()
 
 		key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 		require.NoError(t, err)
@@ -482,7 +488,6 @@ func TestGetCertRetryLogic(t *testing.T) {
 
 	t.Run("invalid token format validation", func(t *testing.T) {
 		service, _ := setupFulcioTestService(t)
-		defer service.server.Stop()
 
 		key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 		require.NoError(t, err)
@@ -500,7 +505,6 @@ func TestGetCertRetryLogic(t *testing.T) {
 
 	t.Run("token without required claims", func(t *testing.T) {
 		service, _ := setupFulcioTestService(t)
-		defer service.server.Stop()
 
 		key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 		require.NoError(t, err)
@@ -536,10 +540,12 @@ func TestGetCertNonRetryableErrors(t *testing.T) {
 
 		go func() {
 			if err := service.server.Serve(lis); err != nil {
-				log.Fatalf("failed to serve: %v", err)
+				t.Logf("failed to serve: %v", err)
 			}
 		}()
-		defer service.server.Stop()
+		t.Cleanup(func() {
+			service.server.Stop()
+		})
 
 		key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 		require.NoError(t, err)
