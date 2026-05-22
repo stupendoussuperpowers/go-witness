@@ -177,6 +177,12 @@ func (p *ptraceContext) runTrace() error {
 
 			// Inject the signal back (e.g., SIGINT, SIGTERM, or Real SIGTRAP)
 			injectedSig := int(sig)
+			// Auto-attached children from PTRACE_O_TRACECLONE/FORK/VFORK are first
+			// reported in a SIGSTOP ptrace-stop. Re-injecting SIGSTOP keeps them
+			// stopped and can deadlock traced programs that create many threads.
+			if sig == unix.SIGSTOP {
+				injectedSig = 0
+			}
 
 			if isSyscallTrap {
 				injectedSig = 0
@@ -188,10 +194,13 @@ func (p *ptraceContext) runTrace() error {
 				// eventCode is in the high bits of the status
 				eventCode := (uint32(status) >> 16) & 0xFFFF
 
-				if eventCode != 0 {
-					// Case 2: Ptrace Event (Exit/Fork/Exec) -> Suppress signal
-					injectedSig = 0
+				// Never re-inject SIGTRAP into the tracee from ptrace stops.
+				// Both non-event SIGTRAP (e.g. initial post-exec stop) and
+				// PTRACE_EVENT stops are debugger artifacts, not tracee signals
+				// that should be delivered back.
+				injectedSig = 0
 
+				if eventCode != 0 {
 					if eventCode == unix.PTRACE_EVENT_EXIT && pid == p.traceePid && p.hasPreExit {
 						if err := p.executeHooks.RunHooks(attestation.StagePreExit, pid); err != nil {
 							log.Errorf("PreExit hooks failed: %v", err)

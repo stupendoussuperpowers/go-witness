@@ -57,6 +57,7 @@ const (
 type ebpfTraceContext struct {
 	hash      []cryptoutil.DigestValue
 	processes map[int]*ProcessInfo
+	seenExec  map[int]bool
 	mu        sync.Mutex
 }
 
@@ -131,6 +132,7 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	pctx := &ebpfTraceContext{
 		hash:      actx.Hashes(),
 		processes: make(map[int]*ProcessInfo),
+		seenExec:  make(map[int]bool),
 	}
 
 	var readErr error
@@ -217,6 +219,7 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			if path != "" {
 				procInfo.Program = path
 			}
+			p.seenExec[pid] = true
 			shouldEnrich = true
 		case eventTypeExit:
 			shouldEnrich = true
@@ -246,7 +249,17 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 	defer p.mu.Unlock()
 
 	processes := make([]ProcessInfo, 0, len(p.processes))
-	for _, procInfo := range p.processes {
+	for pid, procInfo := range p.processes {
+		// Keep parity with ptrace-style reporting:
+		// only include process-like entries that either exec'd or opened files.
+		if !p.seenExec[pid] && len(procInfo.OpenedFiles) == 0 {
+			continue
+		}
+		// Drop obvious helper/kernel-worker style tasks that ptrace flow
+		// typically does not materialize as command-run processes.
+		if strings.HasPrefix(procInfo.Comm, "iou-sqp-") {
+			continue
+		}
 		processes = append(processes, *procInfo)
 	}
 
