@@ -89,7 +89,7 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	}
 	defer objs.Close()
 
-	links := make([]link.Link, 0, 6)
+	links := make([]link.Link, 0, 9)
 	defer closeLinks(links)
 
 	traceOpen, err := link.Tracepoint("syscalls", "sys_enter_open", objs.TraceOpen, nil)
@@ -109,16 +109,31 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 		return nil, fmt.Errorf("attach sys_enter_openat2: %w", err)
 	}
 	links = append(links, traceOpenAt2)
-	traceFork, err := link.Tracepoint("sched", "sched_process_fork", objs.TraceSchedProcessFork, nil)
+
+	traceOpenExit, err := link.Tracepoint("syscalls", "sys_exit_open", objs.TraceOpenExit, nil)
 	if err != nil {
-		return nil, fmt.Errorf("attach sched_process_fork: %w", err)
+		return nil, fmt.Errorf("attach sys_exit_open: %w", err)
 	}
-	links = append(links, traceFork)
+	links = append(links, traceOpenExit)
+
+	traceOpenAtExit, err := link.Tracepoint("syscalls", "sys_exit_openat", objs.TraceOpenatExit, nil)
+	if err != nil {
+		return nil, fmt.Errorf("attach sys_exit_openat: %w", err)
+	}
+	links = append(links, traceOpenAtExit)
+
+	traceOpenAt2Exit, err := link.Tracepoint("syscalls", "sys_exit_openat2", objs.TraceOpenat2Exit, nil)
+	if err != nil {
+		return nil, fmt.Errorf("attach sys_exit_openat2: %w", err)
+	}
+	links = append(links, traceOpenAt2Exit)
+
 	traceExec, err := link.Tracepoint("sched", "sched_process_exec", objs.TraceSchedProcessExec, nil)
 	if err != nil {
 		return nil, fmt.Errorf("attach sched_process_exec: %w", err)
 	}
 	links = append(links, traceExec)
+
 	traceExit, err := link.Tracepoint("sched", "sched_process_exit", objs.TraceSchedProcessExit, nil)
 	if err != nil {
 		return nil, fmt.Errorf("attach sched_process_exit: %w", err)
@@ -192,11 +207,21 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
 			return err
 		}
-
-		pid := int(event.PID)
 		var shouldEnrich bool
 		p.mu.Lock()
-		procInfo := p.getProcInfo(pid)
+
+		pid := int(event.PID)
+		var procInfo *ProcessInfo
+		if event.EventType == eventTypeExit {
+			procInfo = p.processes[pid]
+		} else {
+			if event.EventType == eventTypeOpen {
+				pid = int(event.TID)
+			}
+
+			procInfo = p.getProcInfo(pid)
+		}
+
 		switch event.EventType {
 		case eventTypeOpen:
 			path := cleanString(string(event.Path[:]))
@@ -222,12 +247,14 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			p.seenLife[pid] = true
 			shouldEnrich = true
 		case eventTypeExit:
-			p.seenLife[pid] = true
-			shouldEnrich = true
+			if procInfo != nil {
+				p.seenLife[pid] = true
+				shouldEnrich = true
+			}
 		}
 		p.mu.Unlock()
 		if shouldEnrich {
-			p.populateMetadataForProc(pid)
+			p.populateMetadataForProc(pid, event.EventType == eventTypeExec)
 		}
 	}
 }
@@ -270,6 +297,11 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 				continue
 			}
 		}
+		// Minimal normalization: if program is missing but comm has a simple
+		// executable-like token, promote comm to program for ptrace-like output.
+		if procInfo.Program == "" && procInfo.Comm != "" && !strings.Contains(procInfo.Comm, " ") {
+			procInfo.Program = procInfo.Comm
+		}
 		processes = append(processes, *procInfo)
 	}
 
@@ -289,12 +321,18 @@ func (p *ebpfTraceContext) finalizeOpenedFiles() {
 			digest, err := cryptoutil.CalculateDigestSetFromFile(file, p.hash)
 			if err == nil {
 				procInfo.OpenedFiles[file] = digest
+				continue
+			}
+
+			if _, isPathErr := err.(*os.PathError); isPathErr {
+				// delete(procInfo.OpenedFiles, file)
+				// continue
 			}
 		}
 	}
 }
 
-func (p *ebpfTraceContext) populateMetadataForProc(pid int) {
+func (p *ebpfTraceContext) populateMetadataForProc(pid int, overwrite bool) {
 	statusBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 	cmdlineBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	exePath, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
@@ -337,16 +375,16 @@ func (p *ebpfTraceContext) populateMetadataForProc(pid int) {
 	if procInfo.ParentPID == 0 && ppid > 0 {
 		procInfo.ParentPID = ppid
 	}
-	if procInfo.Comm == "" && comm != "" {
+	if (overwrite || procInfo.Comm == "") && comm != "" {
 		procInfo.Comm = comm
 	}
-	if procInfo.Cmdline == "" && cmdline != "" {
+	if (overwrite || procInfo.Cmdline == "") && cmdline != "" {
 		procInfo.Cmdline = cmdline
 	}
-	if procInfo.Program == "" && exePath != "" {
+	if (overwrite || procInfo.Program == "") && exePath != "" {
 		procInfo.Program = exePath
 	}
-	if procInfo.ExeDigest == nil && exeDigest != nil {
+	if (overwrite || procInfo.ExeDigest == nil) && exeDigest != nil {
 		procInfo.ExeDigest = exeDigest
 	}
 }
