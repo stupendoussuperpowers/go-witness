@@ -24,13 +24,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 
-	commandrunbpf "github.com/in-toto/go-witness/attestation/commandrun/bpf"
-	"github.com/in-toto/go-witness/attestation"
-	"github.com/in-toto/go-witness/cryptoutil"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/in-toto/go-witness/attestation"
+	commandrunbpf "github.com/in-toto/go-witness/attestation/commandrun/bpf"
+	"github.com/in-toto/go-witness/cryptoutil"
 	"golang.org/x/sys/unix"
 )
 
@@ -39,11 +40,19 @@ const (
 )
 
 type fileOpenEvent struct {
-	PID  uint32
-	TID  uint32
-	Dfd  int32
-	Path [256]byte
+	EventType uint32
+	PID       uint32
+	TID       uint32
+	Dfd       int32
+	Path      [256]byte
 }
+
+const (
+	eventTypeOpen = 1
+	eventTypeFork = 2
+	eventTypeExec = 3
+	eventTypeExit = 4
+)
 
 type ebpfTraceContext struct {
 	hash      []cryptoutil.DigestValue
@@ -78,7 +87,7 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	}
 	defer objs.Close()
 
-	links := make([]link.Link, 0, 3)
+	links := make([]link.Link, 0, 6)
 	defer closeLinks(links)
 
 	traceOpen, err := link.Tracepoint("syscalls", "sys_enter_open", objs.TraceOpen, nil)
@@ -98,6 +107,21 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 		return nil, fmt.Errorf("attach sys_enter_openat2: %w", err)
 	}
 	links = append(links, traceOpenAt2)
+	traceFork, err := link.Tracepoint("sched", "sched_process_fork", objs.TraceSchedProcessFork, nil)
+	if err != nil {
+		return nil, fmt.Errorf("attach sched_process_fork: %w", err)
+	}
+	links = append(links, traceFork)
+	traceExec, err := link.Tracepoint("sched", "sched_process_exec", objs.TraceSchedProcessExec, nil)
+	if err != nil {
+		return nil, fmt.Errorf("attach sched_process_exec: %w", err)
+	}
+	links = append(links, traceExec)
+	traceExit, err := link.Tracepoint("sched", "sched_process_exit", objs.TraceSchedProcessExit, nil)
+	if err != nil {
+		return nil, fmt.Errorf("attach sched_process_exit: %w", err)
+	}
+	links = append(links, traceExit)
 
 	reader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -165,24 +189,42 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			return err
 		}
 
-		path := cleanString(string(event.Path[:]))
-		if path == "" {
-			continue
-		}
-
-		resolvedPath := path
-		if !filepath.IsAbs(path) && event.Dfd == unix.AT_FDCWD {
-			if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", event.PID)); err == nil {
-				resolvedPath = filepath.Join(cwd, path)
-			}
-		}
-
+		pid := int(event.PID)
+		var shouldEnrich bool
 		p.mu.Lock()
-		procInfo := p.getProcInfo(int(event.PID))
-		if _, exists := procInfo.OpenedFiles[resolvedPath]; !exists {
-			procInfo.OpenedFiles[resolvedPath] = nil
+		procInfo := p.getProcInfo(pid)
+		switch event.EventType {
+		case eventTypeOpen:
+			path := cleanString(string(event.Path[:]))
+			if path != "" {
+				resolvedPath := path
+				if !filepath.IsAbs(path) && event.Dfd == unix.AT_FDCWD {
+					if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", event.PID)); err == nil {
+						resolvedPath = filepath.Join(cwd, path)
+					}
+				}
+				if _, exists := procInfo.OpenedFiles[resolvedPath]; !exists {
+					procInfo.OpenedFiles[resolvedPath] = nil
+				}
+			}
+		case eventTypeFork:
+			if procInfo.ParentPID == 0 && event.Dfd > 0 {
+				procInfo.ParentPID = int(event.Dfd)
+			}
+			shouldEnrich = true
+		case eventTypeExec:
+			path := cleanString(string(event.Path[:]))
+			if path != "" {
+				procInfo.Program = path
+			}
+			shouldEnrich = true
+		case eventTypeExit:
+			shouldEnrich = true
 		}
 		p.mu.Unlock()
+		if shouldEnrich {
+			p.populateMetadataForProc(pid)
+		}
 	}
 }
 
@@ -226,6 +268,63 @@ func (p *ebpfTraceContext) finalizeOpenedFiles() {
 				procInfo.OpenedFiles[file] = digest
 			}
 		}
+	}
+}
+
+func (p *ebpfTraceContext) populateMetadataForProc(pid int) {
+	statusBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	cmdlineBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	exePath, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+
+	var ppid int
+	if len(statusBytes) > 0 {
+		if parsedPPID, err := getPPIDFromStatus(statusBytes); err == nil {
+			ppid = parsedPPID
+		}
+	}
+	comm := ""
+	if len(statusBytes) > 0 {
+		for _, line := range strings.Split(string(statusBytes), "\n") {
+			if strings.HasPrefix(line, "Name:") {
+				comm = strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
+				break
+			}
+		}
+	}
+	cmdline := ""
+	if len(cmdlineBytes) > 0 {
+		parts := strings.Split(strings.TrimRight(string(cmdlineBytes), "\x00"), "\x00")
+		if len(parts) > 0 && parts[0] != "" {
+			cmdline = strings.Join(parts, " ")
+		}
+	}
+	var exeDigest cryptoutil.DigestSet
+	if exePath != "" {
+		if digest, err := cryptoutil.CalculateDigestSetFromFile(exePath, p.hash); err == nil {
+			exeDigest = digest
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	procInfo, ok := p.processes[pid]
+	if !ok {
+		return
+	}
+	if procInfo.ParentPID == 0 && ppid > 0 {
+		procInfo.ParentPID = ppid
+	}
+	if procInfo.Comm == "" && comm != "" {
+		procInfo.Comm = comm
+	}
+	if procInfo.Cmdline == "" && cmdline != "" {
+		procInfo.Cmdline = cmdline
+	}
+	if procInfo.Program == "" && exePath != "" {
+		procInfo.Program = exePath
+	}
+	if procInfo.ExeDigest == nil && exeDigest != nil {
+		procInfo.ExeDigest = exeDigest
 	}
 }
 

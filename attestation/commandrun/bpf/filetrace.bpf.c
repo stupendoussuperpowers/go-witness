@@ -35,10 +35,49 @@ struct trace_event_raw_sys_enter {
 };
 
 struct file_open_event {
+	__u32 event_type;
 	__u32 pid;
 	__u32 tid;
 	__s32 dfd;
 	char path[256];
+};
+
+enum event_type {
+	EVENT_TYPE_OPEN = 1,
+	EVENT_TYPE_FORK = 2,
+	EVENT_TYPE_EXEC = 3,
+	EVENT_TYPE_EXIT = 4,
+};
+
+struct sched_process_fork_args {
+	__u16 common_type;
+	__u8 common_flags;
+	__u8 common_preempt_count;
+	__s32 common_pid;
+	char parent_comm[16];
+	__s32 parent_pid;
+	char child_comm[16];
+	__s32 child_pid;
+};
+
+struct sched_process_exec_args {
+	__u16 common_type;
+	__u8 common_flags;
+	__u8 common_preempt_count;
+	__s32 common_pid;
+	__u32 pid;
+	__u32 old_pid;
+	char filename[256];
+};
+
+struct sched_process_exit_args {
+	__u16 common_type;
+	__u8 common_flags;
+	__u8 common_preempt_count;
+	__s32 common_pid;
+	char comm[16];
+	__s32 pid;
+	__s32 prio;
 };
 
 struct {
@@ -61,6 +100,7 @@ static __always_inline int submit_open_event(const char *filename, __s32 dfd) {
 	}
 
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	event->event_type = EVENT_TYPE_OPEN;
 	event->pid = pid_tgid >> 32;
 	event->tid = pid_tgid;
 	event->dfd = dfd;
@@ -71,6 +111,75 @@ static __always_inline int submit_open_event(const char *filename, __s32 dfd) {
 		return 0;
 	}
 
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint/sched/sched_process_fork")
+int trace_sched_process_fork(struct sched_process_fork_args *ctx) {
+	if (target_cgroup_id == 0) {
+		return 0;
+	}
+	if (bpf_get_current_cgroup_id() != target_cgroup_id) {
+		return 0;
+	}
+
+	struct file_open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event) {
+		return 0;
+	}
+	event->event_type = EVENT_TYPE_FORK;
+	event->pid = ctx->child_pid;
+	event->tid = ctx->child_pid;
+	event->dfd = ctx->parent_pid;
+	event->path[0] = '\0';
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int trace_sched_process_exec(struct sched_process_exec_args *ctx) {
+	if (target_cgroup_id == 0) {
+		return 0;
+	}
+	if (bpf_get_current_cgroup_id() != target_cgroup_id) {
+		return 0;
+	}
+
+	struct file_open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event) {
+		return 0;
+	}
+	event->event_type = EVENT_TYPE_EXEC;
+	event->pid = ctx->pid;
+	event->tid = ctx->pid;
+	event->dfd = 0;
+	long copied = bpf_probe_read_kernel_str(event->path, sizeof(event->path), ctx->filename);
+	if (copied < 0) {
+		event->path[0] = '\0';
+	}
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int trace_sched_process_exit(struct sched_process_exit_args *ctx) {
+	if (target_cgroup_id == 0) {
+		return 0;
+	}
+	if (bpf_get_current_cgroup_id() != target_cgroup_id) {
+		return 0;
+	}
+
+	struct file_open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event) {
+		return 0;
+	}
+	event->event_type = EVENT_TYPE_EXIT;
+	event->pid = ctx->pid;
+	event->tid = ctx->pid;
+	event->dfd = 0;
+	event->path[0] = '\0';
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }

@@ -211,10 +211,11 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 	hasPreExec := rc.executeHooks.HasHooks(attestation.StagePreExec)
 	hasPreExit := rc.executeHooks.HasHooks(attestation.StagePreExit)
 	needsHookTracing := hasPreExec || hasPreExit
+	needsPtraceTracing := needsHookTracing || (rc.enableTracing && rc.traceBackend != TraceBackendEBPF)
 
 	// Keep ptrace only for hook-driven execution. Plain command-run tracing can
 	// use the eBPF file observer without thread pinning or ptrace signal handling.
-	if needsHookTracing {
+	if needsPtraceTracing {
 		// Locking the thread before enabling tracing and starting the command execution (fork and exec)
 		// Only the parent thread that called fork/clone can issue the subsequent tracing commands
 		runtime.LockOSThread()
