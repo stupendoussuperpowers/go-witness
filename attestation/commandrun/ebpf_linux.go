@@ -58,6 +58,7 @@ type ebpfTraceContext struct {
 	hash      []cryptoutil.DigestValue
 	processes map[int]*ProcessInfo
 	seenExec  map[int]bool
+	seenLife  map[int]bool
 	mu        sync.Mutex
 }
 
@@ -133,6 +134,7 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 		hash:      actx.Hashes(),
 		processes: make(map[int]*ProcessInfo),
 		seenExec:  make(map[int]bool),
+		seenLife:  make(map[int]bool),
 	}
 
 	var readErr error
@@ -210,18 +212,17 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 				}
 			}
 		case eventTypeFork:
+			p.seenLife[pid] = true
 			if procInfo.ParentPID == 0 && event.Dfd > 0 {
 				procInfo.ParentPID = int(event.Dfd)
 			}
 			shouldEnrich = true
 		case eventTypeExec:
-			path := cleanString(string(event.Path[:]))
-			if path != "" {
-				procInfo.Program = path
-			}
 			p.seenExec[pid] = true
+			p.seenLife[pid] = true
 			shouldEnrich = true
 		case eventTypeExit:
+			p.seenLife[pid] = true
 			shouldEnrich = true
 		}
 		p.mu.Unlock()
@@ -251,14 +252,23 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 	processes := make([]ProcessInfo, 0, len(p.processes))
 	for pid, procInfo := range p.processes {
 		// Keep parity with ptrace-style reporting:
-		// only include process-like entries that either exec'd or opened files.
-		if !p.seenExec[pid] && len(procInfo.OpenedFiles) == 0 {
+		// include entries that were observed by lifecycle hooks, exec hooks,
+		// or opened files.
+		if !p.seenLife[pid] && !p.seenExec[pid] && len(procInfo.OpenedFiles) == 0 {
 			continue
 		}
 		// Drop obvious helper/kernel-worker style tasks that ptrace flow
 		// typically does not materialize as command-run processes.
 		if strings.HasPrefix(procInfo.Comm, "iou-sqp-") {
 			continue
+		}
+		// Filter obvious garbage rows produced by transient/bad metadata states.
+		// Keep real auxiliary rows (often parent=0 with sparse fields) as long as
+		// they were observed via lifecycle/file activity.
+		if procInfo.Program != "" && !strings.HasPrefix(procInfo.Program, "/") {
+			if procInfo.Comm == "" && procInfo.Cmdline == "" && len(procInfo.OpenedFiles) == 0 {
+				continue
+			}
 		}
 		processes = append(processes, *procInfo)
 	}
