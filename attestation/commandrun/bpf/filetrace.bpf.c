@@ -14,7 +14,7 @@
 
 // go:build ignore
 
-#include <linux/bpf.h>
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 
 #ifndef AT_FDCWD
@@ -24,54 +24,6 @@
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 volatile const __u64 target_cgroup_id = 0;
-
-struct trace_event_raw_sys_enter_open {
-	__u16 common_type;
-	__u8 common_flags;
-	__u8 common_preempt_count;
-	__s32 common_pid;
-	__s32 __syscall_nr;
-	__u32 __pad0;
-	const char *filename;
-	__u64 flags;
-	__u64 mode;
-};
-
-struct trace_event_raw_sys_enter_openat {
-	__u16 common_type;
-	__u8 common_flags;
-	__u8 common_preempt_count;
-	__s32 common_pid;
-	__s32 __syscall_nr;
-	__u32 __pad0;
-	__s64 dfd;
-	const char *filename;
-	__u64 flags;
-	__u64 mode;
-};
-
-struct trace_event_raw_sys_enter_openat2 {
-	__u16 common_type;
-	__u8 common_flags;
-	__u8 common_preempt_count;
-	__s32 common_pid;
-	__s32 __syscall_nr;
-	__u32 __pad0;
-	__s64 dfd;
-	const char *filename;
-	struct open_how *how;
-	__u64 usize;
-};
-
-struct trace_event_raw_sys_exit {
-	__u16 common_type;
-	__u8 common_flags;
-	__u8 common_preempt_count;
-	__s32 common_pid;
-	__s32 __syscall_nr;
-	__u32 __pad0;
-	__s64 ret;
-};
 
 struct pending_open {
 	__u64 filename;
@@ -325,18 +277,18 @@ int trace_sched_process_exit(struct sched_process_exit_args *ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_enter_open")
-int trace_open(struct trace_event_raw_sys_enter_open *ctx) {
-	return save_open_event(ctx->filename, AT_FDCWD);
+int trace_open(struct trace_event_raw_sys_enter *ctx) {
+	return save_open_event((const char *)ctx->args[0], AT_FDCWD);
 }
 
 SEC("tracepoint/syscalls/sys_enter_openat")
-int trace_openat(struct trace_event_raw_sys_enter_openat *ctx) {
-	return save_open_event(ctx->filename, (__s32)ctx->dfd);
+int trace_openat(struct trace_event_raw_sys_enter *ctx) {
+	return save_open_event((const char *)ctx->args[1], (__s32)ctx->args[0]);
 }
 
 SEC("tracepoint/syscalls/sys_enter_openat2")
-int trace_openat2(struct trace_event_raw_sys_enter_openat2 *ctx) {
-	return save_open_event(ctx->filename, (__s32)ctx->dfd);
+int trace_openat2(struct trace_event_raw_sys_enter *ctx) {
+	return save_open_event((const char *)ctx->args[1], (__s32)ctx->args[0]);
 }
 
 SEC("tracepoint/syscalls/sys_exit_open")
