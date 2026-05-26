@@ -14,8 +14,9 @@
 
 // go:build ignore
 
-#include <linux/bpf.h>
+#include "../../networktrace/bpf/headers/vmlinux.h"
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
 #ifndef AT_FDCWD
 #define AT_FDCWD -100
@@ -76,6 +77,7 @@ struct trace_event_raw_sys_exit {
 struct pending_open {
 	__u64 filename;
 	__s32 dfd;
+	char cwd[256];
 };
 
 struct file_open_event {
@@ -83,6 +85,9 @@ struct file_open_event {
 	__u32 pid;
 	__u32 tid;
 	__s32 dfd;
+	__s32 fd;
+	__s64 error;
+	char cwd[256];
 	char path[256];
 };
 
@@ -91,6 +96,13 @@ enum event_type {
 	EVENT_TYPE_FORK = 2,
 	EVENT_TYPE_EXEC = 3,
 	EVENT_TYPE_EXIT = 4,
+	EVENT_TYPE_ERROR = 5,
+};
+
+enum error_type {
+	ERROR_TYPE_PENDING_OPEN_UPDATE = 1,
+	ERROR_TYPE_PENDING_OPEN_MISSING = 2,
+	ERROR_TYPE_READ_FILENAME = 3,
 };
 
 struct sched_process_fork_args {
@@ -136,6 +148,85 @@ struct {
 	__type(value, struct pending_open);
 } pending_opens SEC(".maps");
 
+static __always_inline void submit_error_event(__s64 error) {
+	if (target_cgroup_id == 0) {
+		return;
+	}
+	if (bpf_get_current_cgroup_id() != target_cgroup_id) {
+		return;
+	}
+
+	struct file_open_event *event =
+	    bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event) {
+		return;
+	}
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	event->event_type = EVENT_TYPE_ERROR;
+	event->pid = pid_tgid >> 32;
+	event->tid = pid_tgid;
+	event->dfd = 0;
+	event->fd = 0;
+	event->error = error;
+	event->cwd[0] = '\0';
+	event->path[0] = '\0';
+	bpf_ringbuf_submit(event, 0);
+}
+
+static __always_inline void fill_base_path(struct task_struct *task, __s32 dfd,
+					   char *buf, __u32 buf_size) {
+	buf[0] = '\0';
+
+	if (dfd == AT_FDCWD) {
+		struct fs_struct *fs = BPF_CORE_READ(task, fs);
+		if (fs) {
+			struct path pwd;
+			BPF_CORE_READ_INTO(&pwd, fs, pwd);
+			if (bpf_d_path(&pwd, buf, buf_size) < 0) {
+				buf[0] = '\0';
+			}
+		}
+		return;
+	}
+
+	if (dfd < 0) {
+		return;
+	}
+
+	struct files_struct *files = BPF_CORE_READ(task, files);
+	if (!files) {
+		return;
+	}
+
+	struct fdtable *fdt = BPF_CORE_READ(files, fdt);
+	if (!fdt) {
+		return;
+	}
+
+	unsigned int max_fds = BPF_CORE_READ(fdt, max_fds);
+	if ((__u32)dfd >= max_fds) {
+		return;
+	}
+
+	struct file **fd = BPF_CORE_READ(fdt, fd);
+	if (!fd) {
+		return;
+	}
+
+	struct file *file = NULL;
+	bpf_core_read(&file, sizeof(file), &fd[dfd]);
+	if (!file) {
+		return;
+	}
+
+	struct path f_path;
+	BPF_CORE_READ_INTO(&f_path, file, f_path);
+	if (bpf_d_path(&f_path, buf, buf_size) < 0) {
+		buf[0] = '\0';
+	}
+}
+
 static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	if (target_cgroup_id == 0) {
 		return 0;
@@ -151,7 +242,13 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	    .filename = (__u64)filename,
 	    .dfd = dfd,
 	};
-	bpf_map_update_elem(&pending_opens, &pid_tgid, &pending, BPF_ANY);
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	fill_base_path(task, dfd, pending.cwd, sizeof(pending.cwd));
+	long update_ret =
+	    bpf_map_update_elem(&pending_opens, &pid_tgid, &pending, BPF_ANY);
+	if (update_ret < 0) {
+		submit_error_event(ERROR_TYPE_PENDING_OPEN_UPDATE);
+	}
 	return 0;
 }
 
@@ -160,17 +257,14 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	struct pending_open *pending =
 	    bpf_map_lookup_elem(&pending_opens, &pid_tgid);
 	if (!pending) {
+		submit_error_event(ERROR_TYPE_PENDING_OPEN_MISSING);
 		return 0;
 	}
 
-	/*
 	if (ret < 0) {
-		bpf_printk("witness open exit drop failed pid=%d tid=%d ret=%lld
-	%s\n", pid_tgid >> 32, (__u32)pid_tgid, ret, __filename);
 		bpf_map_delete_elem(&pending_opens, &pid_tgid);
 		return 0;
 	}
-	*/
 
 	__u64 current_cgroup_id = bpf_get_current_cgroup_id();
 	if (target_cgroup_id == 0 || current_cgroup_id != target_cgroup_id) {
@@ -189,12 +283,18 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	event->pid = pid_tgid >> 32;
 	event->tid = pid_tgid;
 	event->dfd = pending->dfd;
+	event->fd = ret;
+	event->error = 0;
+	__builtin_memcpy(event->cwd, pending->cwd, sizeof(event->cwd));
 
 	const char *filename = (const char *)pending->filename;
 	long copied =
 	    bpf_probe_read_user_str(event->path, sizeof(event->path), filename);
 	if (copied < 0) {
-		bpf_ringbuf_discard(event, 0);
+		event->event_type = EVENT_TYPE_ERROR;
+		event->error = copied;
+		event->path[0] = '\0';
+		bpf_ringbuf_submit(event, 0);
 		bpf_map_delete_elem(&pending_opens, &pid_tgid);
 		return 0;
 	}
@@ -222,6 +322,9 @@ int trace_sched_process_fork(struct sched_process_fork_args *ctx) {
 	event->pid = ctx->child_pid;
 	event->tid = ctx->child_pid;
 	event->dfd = ctx->parent_pid;
+	event->fd = 0;
+	event->error = 0;
+	event->cwd[0] = '\0';
 	event->path[0] = '\0';
 	bpf_ringbuf_submit(event, 0);
 	return 0;
@@ -246,6 +349,9 @@ int trace_sched_process_exec(struct sched_process_exec_args *ctx) {
 	event->pid = pid_tgid >> 32;
 	event->tid = pid_tgid;
 	event->dfd = 0;
+	event->fd = 0;
+	event->error = 0;
+	event->cwd[0] = '\0';
 	long copied = bpf_probe_read_kernel_str(
 	    event->path, sizeof(event->path), ctx->filename);
 	if (copied < 0) {
@@ -273,6 +379,9 @@ int trace_sched_process_exit(struct sched_process_exit_args *ctx) {
 	event->pid = ctx->pid;
 	event->tid = ctx->pid;
 	event->dfd = 0;
+	event->fd = 0;
+	event->error = 0;
+	event->cwd[0] = '\0';
 	event->path[0] = '\0';
 	bpf_ringbuf_submit(event, 0);
 	return 0;

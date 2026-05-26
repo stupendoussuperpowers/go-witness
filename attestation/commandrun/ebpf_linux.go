@@ -27,39 +27,57 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/in-toto/go-witness/attestation"
 	commandrunbpf "github.com/in-toto/go-witness/attestation/commandrun/bpf"
 	"github.com/in-toto/go-witness/cryptoutil"
+	"github.com/in-toto/go-witness/log"
 	"golang.org/x/sys/unix"
 )
 
 const (
 	commandRunTraceCgroupPath = "/sys/fs/cgroup/witness-commandrun"
+	commandRunDigestJobBuffer = 1 << 16
+	commandRunDigestWorkers   = 4
 )
+
+type digestJob struct {
+	pid  int
+	path string
+}
 
 type fileOpenEvent struct {
 	EventType uint32
 	PID       uint32
 	TID       uint32
 	Dfd       int32
+	Fd        int32
+	Error     int64
+	Cwd       [256]byte
 	Path      [256]byte
 }
 
 const (
-	eventTypeOpen = 1
-	eventTypeFork = 2
-	eventTypeExec = 3
-	eventTypeExit = 4
+	eventTypeOpen  = 1
+	eventTypeFork  = 2
+	eventTypeExec  = 3
+	eventTypeExit  = 4
+	eventTypeError = 5
+)
+
+const (
+	errorTypePendingOpenUpdate  = 1
+	errorTypePendingOpenMissing = 2
 )
 
 type ebpfTraceContext struct {
-	hash      []cryptoutil.DigestValue
-	processes map[int]*ProcessInfo
-	seenExec  map[int]bool
-	seenLife  map[int]bool
-	mu        sync.Mutex
+	hash       []cryptoutil.DigestValue
+	processes  map[int]*ProcessInfo
+	digestJobs chan digestJob
+	digestWg   sync.WaitGroup
+	mu         sync.Mutex
 }
 
 func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationContext) ([]ProcessInfo, error) {
@@ -89,56 +107,30 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	}
 	defer objs.Close()
 
-	links := make([]link.Link, 0, 9)
+	links := make([]link.Link, 0, 10)
 	defer closeLinks(links)
 
-	traceOpen, err := link.Tracepoint("syscalls", "sys_enter_open", objs.TraceOpen, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sys_enter_open: %w", err)
+	tracepoints := []struct {
+		group   string
+		name    string
+		program *ebpf.Program
+	}{
+		{"syscalls", "sys_enter_open", objs.TraceOpen},
+		{"syscalls", "sys_enter_openat", objs.TraceOpenat},
+		{"syscalls", "sys_enter_openat2", objs.TraceOpenat2},
+		{"syscalls", "sys_exit_open", objs.TraceOpenExit},
+		{"syscalls", "sys_exit_openat", objs.TraceOpenatExit},
+		{"syscalls", "sys_exit_openat2", objs.TraceOpenat2Exit},
+		{"sched", "sched_process_exec", objs.TraceSchedProcessExec},
+		{"sched", "sched_process_exit", objs.TraceSchedProcessExit},
 	}
-	links = append(links, traceOpen)
-
-	traceOpenAt, err := link.Tracepoint("syscalls", "sys_enter_openat", objs.TraceOpenat, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sys_enter_openat: %w", err)
+	for _, tp := range tracepoints {
+		l, err := link.Tracepoint(tp.group, tp.name, tp.program, nil)
+		if err != nil {
+			return nil, fmt.Errorf("attach %s: %w", tp.name, err)
+		}
+		links = append(links, l)
 	}
-	links = append(links, traceOpenAt)
-
-	traceOpenAt2, err := link.Tracepoint("syscalls", "sys_enter_openat2", objs.TraceOpenat2, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sys_enter_openat2: %w", err)
-	}
-	links = append(links, traceOpenAt2)
-
-	traceOpenExit, err := link.Tracepoint("syscalls", "sys_exit_open", objs.TraceOpenExit, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sys_exit_open: %w", err)
-	}
-	links = append(links, traceOpenExit)
-
-	traceOpenAtExit, err := link.Tracepoint("syscalls", "sys_exit_openat", objs.TraceOpenatExit, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sys_exit_openat: %w", err)
-	}
-	links = append(links, traceOpenAtExit)
-
-	traceOpenAt2Exit, err := link.Tracepoint("syscalls", "sys_exit_openat2", objs.TraceOpenat2Exit, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sys_exit_openat2: %w", err)
-	}
-	links = append(links, traceOpenAt2Exit)
-
-	traceExec, err := link.Tracepoint("sched", "sched_process_exec", objs.TraceSchedProcessExec, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sched_process_exec: %w", err)
-	}
-	links = append(links, traceExec)
-
-	traceExit, err := link.Tracepoint("sched", "sched_process_exit", objs.TraceSchedProcessExit, nil)
-	if err != nil {
-		return nil, fmt.Errorf("attach sched_process_exit: %w", err)
-	}
-	links = append(links, traceExit)
 
 	reader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -148,21 +140,27 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	pctx := &ebpfTraceContext{
 		hash:      actx.Hashes(),
 		processes: make(map[int]*ProcessInfo),
-		seenExec:  make(map[int]bool),
-		seenLife:  make(map[int]bool),
 	}
+	pctx.startDigestWorkers(commandRunDigestWorkers)
 
 	var readErr error
 	var readerWg sync.WaitGroup
 	readerWg.Add(1)
 	go func() {
 		defer readerWg.Done()
-		readErr = pctx.readEvents(reader)
+		if err := pctx.readEvents(reader); err != nil {
+			readErr = err
+			log.Errorf("command-run eBPF trace error: %v", err)
+			if c.Process != nil {
+				_ = c.Process.Kill()
+			}
+		}
 	}()
 
 	if err := c.Start(); err != nil {
 		reader.Close()
 		readerWg.Wait()
+		pctx.finishDigestWorkers()
 		return nil, err
 	}
 
@@ -180,11 +178,10 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 
 	_ = reader.Close()
 	readerWg.Wait()
+	pctx.finishDigestWorkers()
 	if readErr != nil {
-		return nil, readErr
+		return pctx.procInfoArray(), readErr
 	}
-
-	pctx.finalizeOpenedFiles()
 
 	if waitErr != nil {
 		return pctx.procInfoArray(), waitErr
@@ -207,55 +204,112 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
 			return err
 		}
-		var shouldEnrich bool
-		p.mu.Lock()
 
-		pid := int(event.PID)
-		var procInfo *ProcessInfo
-		if event.EventType == eventTypeExit {
-			procInfo = p.processes[pid]
-		} else {
-			if event.EventType == eventTypeOpen {
-				pid = int(event.TID)
-			}
-
-			procInfo = p.getProcInfo(pid)
+		if event.EventType == eventTypeError {
+			return formatEBPFTraceError(event)
 		}
+
+		var shouldEnrich bool
+		pid := int(event.PID)
+		var digestPath string
+
+		var procInfo *ProcessInfo
+
+		p.mu.Lock()
 
 		switch event.EventType {
 		case eventTypeOpen:
+			pid = int(event.TID)
+			procInfo = p.getProcInfo(pid)
+
 			path := cleanString(string(event.Path[:]))
 			if path != "" {
-				resolvedPath := path
-				if !filepath.IsAbs(path) && event.Dfd == unix.AT_FDCWD {
-					if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", event.PID)); err == nil {
-						resolvedPath = filepath.Join(cwd, path)
+				openPath := path
+				if !filepath.IsAbs(path) {
+					if base := cleanString(string(event.Cwd[:])); base != "" {
+						openPath = filepath.Join(base, path)
 					}
 				}
-				if _, exists := procInfo.OpenedFiles[resolvedPath]; !exists {
-					procInfo.OpenedFiles[resolvedPath] = nil
+				if _, exists := procInfo.OpenedFiles[openPath]; !exists {
+					procInfo.OpenedFiles[openPath] = nil
+					digestPath = openPath
 				}
 			}
+
 		case eventTypeFork:
-			p.seenLife[pid] = true
+			procInfo = p.getProcInfo(pid)
 			if procInfo.ParentPID == 0 && event.Dfd > 0 {
 				procInfo.ParentPID = int(event.Dfd)
 			}
 			shouldEnrich = true
 		case eventTypeExec:
-			p.seenExec[pid] = true
-			p.seenLife[pid] = true
+			procInfo = p.getProcInfo(pid)
 			shouldEnrich = true
 		case eventTypeExit:
+			procInfo = p.processes[pid]
 			if procInfo != nil {
-				p.seenLife[pid] = true
 				shouldEnrich = true
 			}
 		}
+
 		p.mu.Unlock()
+
+		if digestPath != "" {
+			p.enqueueDigestJob(digestJob{pid: pid, path: digestPath})
+		}
+
 		if shouldEnrich {
 			p.populateMetadataForProc(pid, event.EventType == eventTypeExec)
 		}
+	}
+}
+
+func formatEBPFTraceError(event fileOpenEvent) error {
+	switch event.Error {
+	case errorTypePendingOpenUpdate:
+		return fmt.Errorf("command-run eBPF trace failed to store pending open for pid %d tid %d", event.PID, event.TID)
+	case errorTypePendingOpenMissing:
+		return fmt.Errorf("command-run eBPF trace missing pending open for pid %d tid %d", event.PID, event.TID)
+	default:
+		return fmt.Errorf("command-run eBPF trace failed to read opened filename for pid %d tid %d: %d", event.PID, event.TID, event.Error)
+	}
+}
+
+func (p *ebpfTraceContext) startDigestWorkers(count int) {
+	p.digestJobs = make(chan digestJob, commandRunDigestJobBuffer)
+	for range count {
+		p.digestWg.Add(1)
+		go p.digestWorker()
+	}
+}
+
+func (p *ebpfTraceContext) finishDigestWorkers() {
+	close(p.digestJobs)
+	p.digestWg.Wait()
+}
+
+func (p *ebpfTraceContext) enqueueDigestJob(job digestJob) {
+	select {
+	case p.digestJobs <- job:
+	default:
+	}
+}
+
+func (p *ebpfTraceContext) digestWorker() {
+	defer p.digestWg.Done()
+	for job := range p.digestJobs {
+		digest, err := cryptoutil.CalculateDigestSetFromFile(job.path, p.hash)
+		if err != nil {
+			continue
+		}
+
+		p.mu.Lock()
+		if procInfo := p.processes[job.pid]; procInfo != nil {
+			if procInfo.OpenedFiles[job.path] == nil {
+				procInfo.OpenedFiles[job.path] = digest
+			}
+		}
+		p.mu.Unlock()
 	}
 }
 
@@ -278,12 +332,6 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 
 	processes := make([]ProcessInfo, 0, len(p.processes))
 	for pid, procInfo := range p.processes {
-		// Keep parity with ptrace-style reporting:
-		// include entries that were observed by lifecycle hooks, exec hooks,
-		// or opened files.
-		if !p.seenLife[pid] && !p.seenExec[pid] && len(procInfo.OpenedFiles) == 0 {
-			continue
-		}
 		// Drop obvious helper/kernel-worker style tasks that ptrace flow
 		// typically does not materialize as command-run processes.
 		if strings.HasPrefix(procInfo.Comm, "iou-sqp-") {
@@ -306,30 +354,6 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 	}
 
 	return processes
-}
-
-func (p *ebpfTraceContext) finalizeOpenedFiles() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for _, procInfo := range p.processes {
-		for file, digestSet := range procInfo.OpenedFiles {
-			if digestSet != nil {
-				continue
-			}
-
-			digest, err := cryptoutil.CalculateDigestSetFromFile(file, p.hash)
-			if err == nil {
-				procInfo.OpenedFiles[file] = digest
-				continue
-			}
-
-			if _, isPathErr := err.(*os.PathError); isPathErr {
-				// delete(procInfo.OpenedFiles, file)
-				// continue
-			}
-		}
-	}
 }
 
 func (p *ebpfTraceContext) populateMetadataForProc(pid int, overwrite bool) {
