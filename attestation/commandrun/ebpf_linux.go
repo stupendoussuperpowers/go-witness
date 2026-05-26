@@ -342,7 +342,7 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 	defer p.mu.Unlock()
 
 	processes := make([]ProcessInfo, 0, len(p.processes))
-	for pid, procInfo := range p.processes {
+	for _, procInfo := range p.processes {
 		// Drop obvious helper/kernel-worker style tasks that ptrace flow
 		// typically does not materialize as command-run processes.
 		if strings.HasPrefix(procInfo.Comm, "iou-sqp-") {
