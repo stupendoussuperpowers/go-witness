@@ -14,9 +14,8 @@
 
 // go:build ignore
 
-#include "../../networktrace/bpf/headers/vmlinux.h"
+#include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_core_read.h>
 
 #ifndef AT_FDCWD
 #define AT_FDCWD -100
@@ -77,7 +76,6 @@ struct trace_event_raw_sys_exit {
 struct pending_open {
 	__u64 filename;
 	__s32 dfd;
-	char cwd[256];
 };
 
 struct file_open_event {
@@ -87,7 +85,6 @@ struct file_open_event {
 	__s32 dfd;
 	__s32 fd;
 	__s64 error;
-	char cwd[256];
 	char path[256];
 };
 
@@ -169,62 +166,8 @@ static __always_inline void submit_error_event(__s64 error) {
 	event->dfd = 0;
 	event->fd = 0;
 	event->error = error;
-	event->cwd[0] = '\0';
 	event->path[0] = '\0';
 	bpf_ringbuf_submit(event, 0);
-}
-
-static __always_inline void fill_base_path(struct task_struct *task, __s32 dfd,
-					   char *buf, __u32 buf_size) {
-	buf[0] = '\0';
-
-	if (dfd == AT_FDCWD) {
-		struct fs_struct *fs = BPF_CORE_READ(task, fs);
-		if (fs) {
-			struct path pwd;
-			BPF_CORE_READ_INTO(&pwd, fs, pwd);
-			if (bpf_d_path(&pwd, buf, buf_size) < 0) {
-				buf[0] = '\0';
-			}
-		}
-		return;
-	}
-
-	if (dfd < 0) {
-		return;
-	}
-
-	struct files_struct *files = BPF_CORE_READ(task, files);
-	if (!files) {
-		return;
-	}
-
-	struct fdtable *fdt = BPF_CORE_READ(files, fdt);
-	if (!fdt) {
-		return;
-	}
-
-	unsigned int max_fds = BPF_CORE_READ(fdt, max_fds);
-	if ((__u32)dfd >= max_fds) {
-		return;
-	}
-
-	struct file **fd = BPF_CORE_READ(fdt, fd);
-	if (!fd) {
-		return;
-	}
-
-	struct file *file = NULL;
-	bpf_core_read(&file, sizeof(file), &fd[dfd]);
-	if (!file) {
-		return;
-	}
-
-	struct path f_path;
-	BPF_CORE_READ_INTO(&f_path, file, f_path);
-	if (bpf_d_path(&f_path, buf, buf_size) < 0) {
-		buf[0] = '\0';
-	}
 }
 
 static __always_inline int save_open_event(const char *filename, __s32 dfd) {
@@ -242,8 +185,6 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	    .filename = (__u64)filename,
 	    .dfd = dfd,
 	};
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	fill_base_path(task, dfd, pending.cwd, sizeof(pending.cwd));
 	long update_ret =
 	    bpf_map_update_elem(&pending_opens, &pid_tgid, &pending, BPF_ANY);
 	if (update_ret < 0) {
@@ -285,7 +226,6 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	event->dfd = pending->dfd;
 	event->fd = ret;
 	event->error = 0;
-	__builtin_memcpy(event->cwd, pending->cwd, sizeof(event->cwd));
 
 	const char *filename = (const char *)pending->filename;
 	long copied =
@@ -324,7 +264,6 @@ int trace_sched_process_fork(struct sched_process_fork_args *ctx) {
 	event->dfd = ctx->parent_pid;
 	event->fd = 0;
 	event->error = 0;
-	event->cwd[0] = '\0';
 	event->path[0] = '\0';
 	bpf_ringbuf_submit(event, 0);
 	return 0;
@@ -351,7 +290,6 @@ int trace_sched_process_exec(struct sched_process_exec_args *ctx) {
 	event->dfd = 0;
 	event->fd = 0;
 	event->error = 0;
-	event->cwd[0] = '\0';
 	long copied = bpf_probe_read_kernel_str(
 	    event->path, sizeof(event->path), ctx->filename);
 	if (copied < 0) {
@@ -381,7 +319,6 @@ int trace_sched_process_exit(struct sched_process_exit_args *ctx) {
 	event->dfd = 0;
 	event->fd = 0;
 	event->error = 0;
-	event->cwd[0] = '\0';
 	event->path[0] = '\0';
 	bpf_ringbuf_submit(event, 0);
 	return 0;

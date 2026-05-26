@@ -55,7 +55,6 @@ type fileOpenEvent struct {
 	Dfd       int32
 	Fd        int32
 	Error     int64
-	Cwd       [256]byte
 	Path      [256]byte
 }
 
@@ -224,12 +223,7 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 
 			path := cleanString(string(event.Path[:]))
 			if path != "" {
-				openPath := path
-				if !filepath.IsAbs(path) {
-					if base := cleanString(string(event.Cwd[:])); base != "" {
-						openPath = filepath.Join(base, path)
-					}
-				}
+				openPath := resolveOpenPath(int(event.PID), int(event.Dfd), path)
 				if _, exists := procInfo.OpenedFiles[openPath]; !exists {
 					procInfo.OpenedFiles[openPath] = nil
 					digestPath = openPath
@@ -262,6 +256,23 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			p.populateMetadataForProc(pid, event.EventType == eventTypeExec)
 		}
 	}
+}
+
+func resolveOpenPath(pid, dfd int, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+
+	procPath := fmt.Sprintf("/proc/%d/fd/%d", pid, dfd)
+	if dfd == unix.AT_FDCWD {
+		procPath = fmt.Sprintf("/proc/%d/cwd", pid)
+	}
+
+	if base, err := os.Readlink(procPath); err == nil {
+		return filepath.Join(base, path)
+	}
+
+	return path
 }
 
 func formatEBPFTraceError(event fileOpenEvent) error {
