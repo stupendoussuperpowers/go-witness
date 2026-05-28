@@ -39,10 +39,6 @@ const (
 	TraceBackendEBPF   = "ebpf"
 )
 
-const (
-	EBPFTracerSyscall = "syscall"
-)
-
 // This is a hacky way to create a compile time error in case the attestor
 // doesn't implement the expected interfaces.
 var (
@@ -92,12 +88,6 @@ func WithTraceBackend(backend string) Option {
 	}
 }
 
-func WithEBPFTracer(tracer string) Option {
-	return func(cr *CommandRun) {
-		cr.ebpfTracer = tracer
-	}
-}
-
 func WithSilent(silent bool) Option {
 	return func(cr *CommandRun) {
 		cr.silent = silent
@@ -107,7 +97,6 @@ func WithSilent(silent bool) Option {
 func New(opts ...Option) *CommandRun {
 	cr := &CommandRun{
 		traceBackend: TraceBackendPtrace,
-		ebpfTracer:   EBPFTracerSyscall,
 	}
 
 	for _, opt := range opts {
@@ -141,7 +130,6 @@ type CommandRun struct {
 	materials     map[string]cryptoutil.DigestSet
 	enableTracing bool
 	traceBackend  string
-	ebpfTracer    string
 	executeHooks  *attestation.ExecuteHooks
 }
 
