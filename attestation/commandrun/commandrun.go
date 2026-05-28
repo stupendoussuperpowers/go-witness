@@ -193,6 +193,10 @@ func (rc *CommandRun) DeclareHooks(hooks *attestation.ExecuteHooks) error {
 }
 
 func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
+	if err := rc.validateTraceBackend(); err != nil {
+		return err
+	}
+
 	c := exec.Command(rc.Cmd[0], rc.Cmd[1:]...)
 	c.Dir = ctx.WorkingDir()
 	stdoutBuffer := bytes.Buffer{}
@@ -223,7 +227,7 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 	hasPreExec := rc.executeHooks.HasHooks(attestation.StagePreExec)
 	hasPreExit := rc.executeHooks.HasHooks(attestation.StagePreExit)
 	needsHookTracing := hasPreExec || hasPreExit
-	needsPtraceTracing := needsHookTracing || (rc.enableTracing && rc.traceBackend != TraceBackendEBPF)
+	needsPtraceTracing := needsHookTracing || (rc.enableTracing && !rc.usesEBPFTracing())
 
 	// Keep ptrace only for hook-driven execution. Plain command-run tracing can
 	// use the eBPF file observer without thread pinning or ptrace signal handling.
@@ -237,7 +241,7 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 
 	var err error
 
-	if rc.enableTracing && !needsHookTracing && rc.traceBackend == TraceBackendEBPF {
+	if rc.enableTracing && !needsHookTracing && rc.usesEBPFTracing() {
 		rc.Processes, err = rc.traceWithEBPF(c, ctx)
 	} else {
 		if err := c.Start(); err != nil {
@@ -245,7 +249,7 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 		}
 	}
 
-	if rc.enableTracing && (rc.traceBackend != TraceBackendEBPF || needsHookTracing) {
+	if rc.enableTracing && (!rc.usesEBPFTracing() || needsHookTracing) {
 		rc.Processes, err = rc.trace(c, ctx, hasPreExec, hasPreExit)
 	} else if needsHookTracing {
 		err = rc.runWithHooks(c, hasPreExec, hasPreExit)
@@ -259,4 +263,18 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 	rc.Stdout = stdoutBuffer.String()
 	rc.Stderr = stderrBuffer.String()
 	return err
+}
+
+func (rc *CommandRun) validateTraceBackend() error {
+	if rc.traceBackend == "" {
+		rc.traceBackend = TraceBackendPtrace
+	}
+
+	switch rc.traceBackend {
+	case TraceBackendPtrace, TraceBackendEBPF:
+		fmt.Printf("Using Tracing backend: %v\n", rc.traceBackend)
+		return nil
+	default:
+		return fmt.Errorf("unsupported trace backend %q", rc.traceBackend)
+	}
 }
