@@ -41,3 +41,14 @@ lint: ## Run the linter
 .PHONY: check-aws-certs
 check-aws-certs: ## Check the AWS public keys used to verify AWS IID documents
 	GOWORK=off go run -C ./attestation/aws-iid/check-certs/ . ../aws-certs.go
+
+.PHONY: generate-vmlinux
+generate-vmlinux: ## Generate vmlinux.h from kernel BTF (requires bpftool)
+	@echo "Generating vmlinux.h from kernel BTF..."
+	@command -v bpftool >/dev/null 2>&1 || { echo "Error: bpftool is required. Install with: apt install linux-tools-common linux-tools-$(uname -r)"; exit 1; }
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > ./attestation/bpf-common/headers/vmlinux.h
+
+.PHONY: generate-commandrun-bpf
+generate-commandrun-bpf: ## Generate BPF bytecode and Go bindings for command-run file tracing
+	@echo "Generating command-run BPF code (requires clang and llvm)..."
+	go generate -tags linux ./attestation/commandrun/bpf/...

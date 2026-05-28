@@ -34,6 +34,15 @@ const (
 	RunType = attestation.ExecuteRunType
 )
 
+const (
+	TraceBackendPtrace = "ptrace"
+	TraceBackendEBPF   = "ebpf"
+)
+
+const (
+	EBPFTracerSyscall = "syscall"
+)
+
 // This is a hacky way to create a compile time error in case the attestor
 // doesn't implement the expected interfaces.
 var (
@@ -77,6 +86,18 @@ func WithTracing(enabled bool) Option {
 	}
 }
 
+func WithTraceBackend(backend string) Option {
+	return func(cr *CommandRun) {
+		cr.traceBackend = backend
+	}
+}
+
+func WithEBPFTracer(tracer string) Option {
+	return func(cr *CommandRun) {
+		cr.ebpfTracer = tracer
+	}
+}
+
 func WithSilent(silent bool) Option {
 	return func(cr *CommandRun) {
 		cr.silent = silent
@@ -84,7 +105,10 @@ func WithSilent(silent bool) Option {
 }
 
 func New(opts ...Option) *CommandRun {
-	cr := &CommandRun{}
+	cr := &CommandRun{
+		traceBackend: TraceBackendPtrace,
+		ebpfTracer:   EBPFTracerSyscall,
+	}
 
 	for _, opt := range opts {
 		opt(cr)
@@ -116,6 +140,8 @@ type CommandRun struct {
 	silent        bool
 	materials     map[string]cryptoutil.DigestSet
 	enableTracing bool
+	traceBackend  string
+	ebpfTracer    string
 	executeHooks  *attestation.ExecuteHooks
 }
 
@@ -197,8 +223,11 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 	hasPreExec := rc.executeHooks.HasHooks(attestation.StagePreExec)
 	hasPreExit := rc.executeHooks.HasHooks(attestation.StagePreExit)
 	needsHookTracing := hasPreExec || hasPreExit
+	needsPtraceTracing := needsHookTracing || (rc.enableTracing && rc.traceBackend != TraceBackendEBPF)
 
-	if rc.enableTracing || needsHookTracing {
+	// Keep ptrace only for hook-driven execution. Plain command-run tracing can
+	// use the eBPF file observer without thread pinning or ptrace signal handling.
+	if needsPtraceTracing {
 		// Locking the thread before enabling tracing and starting the command execution (fork and exec)
 		// Only the parent thread that called fork/clone can issue the subsequent tracing commands
 		runtime.LockOSThread()
@@ -206,17 +235,21 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 		enableTracing(c)
 	}
 
-	if err := c.Start(); err != nil {
-		return err
-	}
-
 	var err error
 
-	if rc.enableTracing {
+	if rc.enableTracing && !needsHookTracing && rc.traceBackend == TraceBackendEBPF {
+		rc.Processes, err = rc.traceWithEBPF(c, ctx)
+	} else {
+		if err := c.Start(); err != nil {
+			return err
+		}
+	}
+
+	if rc.enableTracing && (rc.traceBackend != TraceBackendEBPF || needsHookTracing) {
 		rc.Processes, err = rc.trace(c, ctx, hasPreExec, hasPreExit)
 	} else if needsHookTracing {
 		err = rc.runWithHooks(c, hasPreExec, hasPreExit)
-	} else {
+	} else if !rc.enableTracing {
 		err = c.Wait()
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			rc.ExitCode = exitErr.ExitCode()
