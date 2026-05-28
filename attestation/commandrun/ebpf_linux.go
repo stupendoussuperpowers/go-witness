@@ -27,7 +27,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/in-toto/go-witness/attestation"
@@ -76,14 +75,8 @@ type ebpfTraceContext struct {
 	mu         sync.Mutex
 }
 
-type ebpfTracer interface {
-	load(cgroupID uint64) (*loadedEBPFTracer, error)
-}
-
-type loadedEBPFTracer struct {
-	name   string
-	events *ebpf.Map
-	close  func() error
+func (rc *CommandRun) usesEBPFTracing() bool {
+	return rc.traceBackend == TraceBackendEBPF
 }
 
 func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationContext) ([]ProcessInfo, error) {
@@ -104,17 +97,19 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 		processes: make(map[int]*ProcessInfo),
 	}
 
-	tracer, err := rc.ebpfFileTracer()
-	if err != nil {
-		return nil, err
+	var loaded *loadedEBPFTracer
+	switch rc.traceBackend {
+	case TraceBackendEBPF:
+		loaded, err = loadSyscallEBPFTracer(cgroupID)
+	default:
+		return nil, fmt.Errorf("Unknown EBPF backend: %s", rc.traceBackend)
 	}
-
-	loaded, err := tracer.load(cgroupID)
 	if err != nil {
-		return nil, fmt.Errorf("load command-run eBPF %s file tracer: %w", rc.ebpfTracer, err)
+		return nil, fmt.Errorf("load command-run eBPF file tracer: %w", err)
 	}
 	defer loaded.close()
-	log.Infof("Using command-run eBPF %s file tracking", loaded.name)
+
+	log.Infof("Using tracer: %s for command-run", rc.traceBackend)
 
 	reader, err := ringbuf.NewReader(loaded.events)
 	if err != nil {
@@ -170,17 +165,6 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	return pctx.procInfoArray(), nil
 }
 
-func (rc *CommandRun) ebpfFileTracer() (ebpfTracer, error) {
-	switch rc.ebpfTracer {
-	case "", EBPFTracerSyscall:
-		return syscallEBPFTracer{}, nil
-	//case EBPFTracerLSM:
-	//	return lsmEBPFTracer{}, nil
-	default:
-		return nil, fmt.Errorf("unknown command-run eBPF tracer %q", rc.ebpfTracer)
-	}
-}
-
 func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 	for {
 		record, err := reader.Read()
@@ -214,6 +198,9 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			procInfo = p.getProcInfo(pid)
 
 			path := cleanPathBuffer(event.Path[:], event.Error)
+
+			fmt.Printf("ReadEvent[%d] %s -> %s\n", pid, event.Path[:], path)
+
 			if path != "" {
 				openPath := resolveOpenPath(int(event.PID), int(event.Dfd), path)
 				if _, exists := procInfo.OpenedFiles[openPath]; !exists {

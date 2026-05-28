@@ -24,9 +24,12 @@ import (
 	commandrunbpf "github.com/in-toto/go-witness/attestation/commandrun/bpf"
 )
 
-type syscallEBPFTracer struct{}
+type loadedEBPFTracer struct {
+	events *ebpf.Map
+	close  func() error
+}
 
-func (syscallEBPFTracer) load(cgroupID uint64) (*loadedEBPFTracer, error) {
+func loadSyscallEBPFTracer(cgroupID uint64) (*loadedEBPFTracer, error) {
 	spec, err := commandrunbpf.LoadFiletraceSyscall()
 	if err != nil {
 		return nil, fmt.Errorf("load spec: %w", err)
@@ -65,7 +68,6 @@ func (syscallEBPFTracer) load(cgroupID uint64) (*loadedEBPFTracer, error) {
 	}
 
 	return &loadedEBPFTracer{
-		name:   EBPFTracerSyscall,
 		events: objs.Events,
 		close: func() error {
 			closeLinks(links)
