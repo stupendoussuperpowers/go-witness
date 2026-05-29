@@ -263,12 +263,7 @@ func (rc *CommandRun) validateTraceBackend() error {
 	}
 
 	switch rc.traceBackend {
-<<<<<<< HEAD
 	case TraceBackendPtrace, TraceBackendEBPF, TraceBackendEBPFLSM:
-		fmt.Printf("Using Tracing backend: %v\n", rc.traceBackend)
-=======
-	case TraceBackendPtrace, TraceBackendEBPF:
->>>>>>> commandrun-ebpf-init
 		return nil
 	default:
 		return fmt.Errorf("unsupported trace backend %q", rc.traceBackend)
