@@ -24,7 +24,7 @@ import (
 )
 
 func (rc *CommandRun) usesEBPFTracing() bool {
-	return rc.traceBackend == TraceBackendEBPF
+	return rc.traceBackend == TraceBackendEBPF || rc.traceBackend == TraceBackendEBPFLSM
 }
 
 func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationContext) ([]ProcessInfo, error) {

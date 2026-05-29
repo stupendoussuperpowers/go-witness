@@ -76,7 +76,7 @@ type ebpfTraceContext struct {
 }
 
 func (rc *CommandRun) usesEBPFTracing() bool {
-	return rc.traceBackend == TraceBackendEBPF
+	return rc.traceBackend == TraceBackendEBPF || rc.traceBackend == TraceBackendEBPFLSM
 }
 
 func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationContext) ([]ProcessInfo, error) {
@@ -101,6 +101,8 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	switch rc.traceBackend {
 	case TraceBackendEBPF:
 		loaded, err = loadSyscallEBPFTracer(cgroupID)
+	case TraceBackendEBPFLSM:
+		loaded, err = loadLSMEBPFTracer(cgroupID)
 	default:
 		return nil, fmt.Errorf("Unknown EBPF backend: %s", rc.traceBackend)
 	}

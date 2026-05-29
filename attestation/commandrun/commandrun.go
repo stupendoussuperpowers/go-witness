@@ -35,8 +35,9 @@ const (
 )
 
 const (
-	TraceBackendPtrace = "ptrace"
-	TraceBackendEBPF   = "ebpf"
+	TraceBackendPtrace  = "ptrace"
+	TraceBackendEBPF    = "ebpf"
+	TraceBackendEBPFLSM = "ebpf-lsm"
 )
 
 // This is a hacky way to create a compile time error in case the attestor
@@ -259,7 +260,7 @@ func (rc *CommandRun) validateTraceBackend() error {
 	}
 
 	switch rc.traceBackend {
-	case TraceBackendPtrace, TraceBackendEBPF:
+	case TraceBackendPtrace, TraceBackendEBPF, TraceBackendEBPFLSM:
 		fmt.Printf("Using Tracing backend: %v\n", rc.traceBackend)
 		return nil
 	default:
