@@ -34,13 +34,12 @@ const (
 	RunType = attestation.ExecuteRunType
 )
 
+// List of supported tracing backends. The CLI provides these through the --trace-backend
+// argument. Default: ptrace.
 const (
 	TraceBackendPtrace  = "ptrace"
 	TraceBackendEBPF    = "ebpf"
 	TraceBackendEBPFLSM = "ebpf-lsm"
-	// TraceBackendEBPF runs command-run file tracing through the Linux eBPF
-	// observer instead of ptrace. Other eBPF modes should be added here as
-	// first-class backends so the CLI can keep passing this string through.
 )
 
 // This is a hacky way to create a compile time error in case the attestor
@@ -233,6 +232,7 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 
 	var err error
 
+	// Check if the tracer being used is eBPF based.
 	if rc.enableTracing && !needsHookTracing && rc.usesEBPFTracing() {
 		rc.Processes, err = rc.traceWithEBPF(c, ctx)
 	} else {
@@ -263,8 +263,12 @@ func (rc *CommandRun) validateTraceBackend() error {
 	}
 
 	switch rc.traceBackend {
+<<<<<<< HEAD
 	case TraceBackendPtrace, TraceBackendEBPF, TraceBackendEBPFLSM:
 		fmt.Printf("Using Tracing backend: %v\n", rc.traceBackend)
+=======
+	case TraceBackendPtrace, TraceBackendEBPF:
+>>>>>>> commandrun-ebpf-init
 		return nil
 	default:
 		return fmt.Errorf("unsupported trace backend %q", rc.traceBackend)
