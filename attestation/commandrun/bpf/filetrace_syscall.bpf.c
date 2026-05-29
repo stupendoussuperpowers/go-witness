@@ -25,6 +25,9 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+/* Pending opens are retained between sys_entry and sys_exit tracepoints.
+ * If sys_entry successfully reads the path string, it's stored in path.
+ */
 struct pending_open {
 	__u64 filename;
 	__s32 dfd;
@@ -39,6 +42,10 @@ struct {
 	__type(value, struct pending_open);
 } pending_opens SEC(".maps");
 
+/* Capture the path as early as possible. Reading user-strings might fail at
+ * this stage in which case the original pointer is kept so that it can be tried
+ * on syscall exit.
+ */
 static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	if (!commandrun_in_target_cgroup()) {
 		return 0;
@@ -68,6 +75,7 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	return 0;
 }
 
+/* Submit the open event after the syscall returns. */
 static __always_inline int submit_pending_open_event(__s64 ret) {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct pending_open *pending =
@@ -121,6 +129,7 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	return 0;
 }
 
+/* Extract path pointer and CWD before passing it to the map/buffer update functions. */
 SEC("tracepoint/syscalls/sys_enter_open")
 int trace_open(struct trace_event_raw_sys_enter *ctx) {
 	return save_open_event((const char *)ctx->args[0], AT_FDCWD);

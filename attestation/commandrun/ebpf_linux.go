@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/in-toto/go-witness/attestation"
@@ -55,6 +56,13 @@ type fileOpenEvent struct {
 	Path      [256]byte
 }
 
+// loadedEBPFTracer is the generic contract between a BPF backend and this
+// runner: an events map to read and a close function for links/objects.
+type loadedEBPFTracer struct {
+	events *ebpf.Map
+	close  func() error
+}
+
 const (
 	eventTypeOpen  = 1
 	eventTypeExec  = 2
@@ -79,6 +87,10 @@ func (rc *CommandRun) usesEBPFTracing() bool {
 	return rc.traceBackend == TraceBackendEBPF || rc.traceBackend == TraceBackendEBPFLSM
 }
 
+// Common userspace harness for command-run eBPF tracing.
+// - Crate per-run cgroup.
+// - Load selected BPF program, drain the ring-bugger that stores open/exec/exit events.
+// - Process events to populate ProcessInfo and OpenedFiles.
 func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationContext) ([]ProcessInfo, error) {
 	cgroupFile, cgroupID, err := prepareCommandRunTraceCgroup()
 	if err != nil {
@@ -113,6 +125,8 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 
 	log.Infof("Using tracer: %s for command-run", rc.traceBackend)
 
+	// Start the ring buffer reader before the command starts so short-lived
+	// processes cannot fill the buffer before userspace begins draining it.
 	reader, err := ringbuf.NewReader(loaded.events)
 	if err != nil {
 		return nil, fmt.Errorf("create command-run file trace reader: %w", err)
@@ -126,6 +140,8 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	go func() {
 		defer readerWg.Done()
 		if err := pctx.readEvents(reader); err != nil {
+			// Internal tracing errors mean the attestation may be incomplete.
+			// Stop the command and propagate the error instead of finishing with missing events.
 			readErr = err
 			log.Errorf("command-run eBPF trace error: %v", err)
 			if c.Process != nil {
@@ -167,6 +183,9 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	return pctx.procInfoArray(), nil
 }
 
+// readEvents is deliberately thin because it is the ring-buffer drain loop. It
+// decodes one event, performs the minimum ProcessInfo update, and queues slower
+// work outside the lock so the kernel buffer is drained before it overruns.
 func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 	for {
 		record, err := reader.Read()
@@ -224,10 +243,14 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 		p.mu.Unlock()
 
 		if digestPath != "" {
+			// Digest calculation can block on disk I/O. Queue it after the
+			// event update so the ring-buffer reader keeps moving.
 			p.enqueueDigestJob(digestJob{pid: pid, path: digestPath})
 		}
 
 		if shouldEnrich {
+			// /proc enrichment is attestation-schema work, not BPF plumbing.
+			// Keep it out of the locked event update path.
 			p.populateMetadataForProc(pid, event.EventType == eventTypeExec)
 		}
 	}
@@ -282,6 +305,9 @@ func formatEBPFTraceError(event fileOpenEvent) error {
 	}
 }
 
+// Digest workers fill in OpenedFiles hashes asynchronously. If a temporary file
+// disappears before it can be hashed, the file remains in the attestation with
+// an empty digest instead of blocking or failing the event reader.
 func (p *ebpfTraceContext) startDigestWorkers(count int) {
 	p.digestJobs = make(chan digestJob, commandRunDigestJobBuffer)
 	for range count {
@@ -295,6 +321,8 @@ func (p *ebpfTraceContext) finishDigestWorkers() {
 	p.digestWg.Wait()
 }
 
+// enqueueDigestJob is non-blocking by design. Dropping a digest job is less bad
+// than stalling the ring-buffer reader and losing later file events.
 func (p *ebpfTraceContext) enqueueDigestJob(job digestJob) {
 	select {
 	case p.digestJobs <- job:
@@ -320,6 +348,9 @@ func (p *ebpfTraceContext) digestWorker() {
 	}
 }
 
+// getProcInfo and the helpers below translate raw trace events into the
+// command-run attestation schema. Generic BPF helpers are kept at the bottom of
+// this file.
 func (p *ebpfTraceContext) getProcInfo(pid int) *ProcessInfo {
 	procInfo, ok := p.processes[pid]
 	if !ok {
@@ -333,6 +364,8 @@ func (p *ebpfTraceContext) getProcInfo(pid int) *ProcessInfo {
 	return procInfo
 }
 
+// procInfoArray performs final schema normalization before returning the
+// process list to the command-run attestor.
 func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -344,9 +377,7 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 		if strings.HasPrefix(procInfo.Comm, "iou-sqp-") {
 			continue
 		}
-		// Filter obvious garbage rows produced by transient/bad metadata states.
-		// Keep real auxiliary rows (often parent=0 with sparse fields) as long as
-		// they were observed via lifecycle/file activity.
+		// Filter rows produced by transient/bad metadata states.
 		if procInfo.Program != "" && !strings.HasPrefix(procInfo.Program, "/") {
 			if procInfo.Comm == "" && procInfo.Cmdline == "" && len(procInfo.OpenedFiles) == 0 {
 				continue
@@ -363,6 +394,8 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 	return processes
 }
 
+// Enrich ProcessInfo from /proc. These reads are best
+// effort because exec/exit events can race with process teardown.
 func (p *ebpfTraceContext) populateMetadataForProc(pid int, overwrite bool) {
 	statusBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 	cmdlineBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
@@ -419,6 +452,7 @@ func (p *ebpfTraceContext) populateMetadataForProc(pid int, overwrite bool) {
 	}
 }
 
+// Generic eBPF plumbing. cgroup id is used to filter for commands being traced.
 func prepareCommandRunTraceCgroup() (*os.File, uint64, error) {
 	if err := os.MkdirAll(commandRunTraceCgroupPath, 0o755); err != nil {
 		return nil, 0, fmt.Errorf("create command-run trace cgroup: %w", err)

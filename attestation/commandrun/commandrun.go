@@ -38,6 +38,9 @@ const (
 	TraceBackendPtrace  = "ptrace"
 	TraceBackendEBPF    = "ebpf"
 	TraceBackendEBPFLSM = "ebpf-lsm"
+	// TraceBackendEBPF runs command-run file tracing through the Linux eBPF
+	// observer instead of ptrace. Other eBPF modes should be added here as
+	// first-class backends so the CLI can keep passing this string through.
 )
 
 // This is a hacky way to create a compile time error in case the attestor
