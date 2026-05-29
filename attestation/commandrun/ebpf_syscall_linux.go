@@ -24,11 +24,10 @@ import (
 	commandrunbpf "github.com/in-toto/go-witness/attestation/commandrun/bpf"
 )
 
-type loadedEBPFTracer struct {
-	events *ebpf.Map
-	close  func() error
-}
-
+// File tracing for command-run using syscall tracepoints. Tracepoints are attached to both
+// sys_entry and sys_exit for open* and exec/exit which emit these events through a shared
+// ring buffer.
+// open* are used for tracking OpenedFiles, exec/exit to track lifecycle events.
 func loadSyscallEBPFTracer(cgroupID uint64) (*loadedEBPFTracer, error) {
 	spec, err := commandrunbpf.LoadFiletraceSyscall()
 	if err != nil {
@@ -44,6 +43,8 @@ func loadSyscallEBPFTracer(cgroupID uint64) (*loadedEBPFTracer, error) {
 	}
 
 	links := make([]link.Link, 0, 8)
+	// Keep all attach points here so adding/removing syscall coverage is local
+	// to the syscall tracer instead of the shared eBPF runner.
 	for _, tp := range []struct {
 		group   string
 		name    string

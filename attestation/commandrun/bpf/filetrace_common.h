@@ -15,8 +15,14 @@
 #ifndef WITNESS_COMMANDRUN_FILETRACE_COMMON_H
 #define WITNESS_COMMANDRUN_FILETRACE_COMMON_H
 
+/* Set by Go before load. Every program uses it to ignore processes outside the
+ * command-run cgroup, which keeps witness' own file activity out of the output.
+ */
 volatile const __u64 target_cgroup_id = 0;
 
+/* Shared ring-buffer payload consumed by ebpf_linux.go. Keep this layout in
+ * sync with fileOpenEvent on the Go side.
+ */
 struct file_open_event {
 	__u32 event_type;
 	__u32 pid;
@@ -58,6 +64,7 @@ struct sched_process_exit_args {
 	__s32 prio;
 };
 
+/* Ring buffer that store open, exec, and exit events captured by tracepoints. */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 29);
@@ -70,6 +77,10 @@ static __always_inline int commandrun_in_target_cgroup() {
 	return bpf_get_current_cgroup_id() == target_cgroup_id;
 }
 
+/* Internal failures are stored as special Error events so that the buffer-draining
+ * code can fail the attestor. This ensures that we do not silently swallow errors
+ * that might cause the attestor to be incomplete.
+ */
 static __always_inline void submit_error_event(__s64 error) {
 	if (!commandrun_in_target_cgroup()) {
 		return;
@@ -91,6 +102,9 @@ static __always_inline void submit_error_event(__s64 error) {
 	bpf_ringbuf_submit(event, 0);
 }
 
+/* sched_process_exec and sched_process_exit give userspace enough lifecycle
+ * information to create/enrich ProcessInfo records around the open events.
+ */
 SEC("tracepoint/sched/sched_process_exec")
 int trace_sched_process_exec(struct sched_process_exec_args *ctx) {
 	if (!commandrun_in_target_cgroup()) {
