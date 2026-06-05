@@ -17,7 +17,9 @@
 package commandrun
 
 import (
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -48,21 +50,25 @@ func loadSyscallEBPFTracer(cgroupID uint64) (*loadedEBPFTracer, error) {
 
 	links := make([]link.Link, 0, 8)
 	for _, tp := range []struct {
-		group   string
-		name    string
-		program *ebpf.Program
+		group    string
+		name     string
+		program  *ebpf.Program
+		required bool
 	}{
-		{"syscalls", "sys_enter_open", objs.TraceOpen},
-		{"syscalls", "sys_enter_openat", objs.TraceOpenat},
-		{"syscalls", "sys_enter_openat2", objs.TraceOpenat2},
-		{"syscalls", "sys_exit_open", objs.TraceOpenExit},
-		{"syscalls", "sys_exit_openat", objs.TraceOpenatExit},
-		{"syscalls", "sys_exit_openat2", objs.TraceOpenat2Exit},
-		{"sched", "sched_process_exec", objs.TraceSchedProcessExec},
-		{"sched", "sched_process_exit", objs.TraceSchedProcessExit},
+		{"syscalls", "sys_enter_open", objs.TraceOpen, false},
+		{"syscalls", "sys_enter_openat", objs.TraceOpenat, true},
+		{"syscalls", "sys_enter_openat2", objs.TraceOpenat2, false},
+		{"syscalls", "sys_exit_open", objs.TraceOpenExit, false},
+		{"syscalls", "sys_exit_openat", objs.TraceOpenatExit, true},
+		{"syscalls", "sys_exit_openat2", objs.TraceOpenat2Exit, false},
+		{"sched", "sched_process_exec", objs.TraceSchedProcessExec, true},
+		{"sched", "sched_process_exit", objs.TraceSchedProcessExit, true},
 	} {
 		l, err := link.Tracepoint(tp.group, tp.name, tp.program, nil)
 		if err != nil {
+			if !tp.required && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			closeLinks(links)
 			objs.Close()
 			return nil, fmt.Errorf("attach %s/%s: %w", tp.group, tp.name, err)

@@ -196,8 +196,12 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 		}
 
 		var event fileOpenEvent
+		eventSize := binary.Size(event)
+		if len(record.RawSample) != eventSize {
+			return fmt.Errorf("read command-run eBPF event: expected %d bytes, got %d", eventSize, len(record.RawSample))
+		}
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			return err
+			return fmt.Errorf("decode command-run eBPF event: %w", err)
 		}
 
 		if event.EventType == eventTypeError {
@@ -218,8 +222,6 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			procInfo = p.getProcInfo(pid)
 
 			path := cleanPathBuffer(event.Path[:], event.Error)
-
-			fmt.Printf("ReadEvent[%d] %s -> %s\n", pid, event.Path[:], path)
 
 			if path != "" {
 				openPath := resolveOpenPath(int(event.PID), int(event.Dfd), path)
