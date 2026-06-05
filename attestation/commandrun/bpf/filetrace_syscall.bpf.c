@@ -1,4 +1,4 @@
-//go:build ignore
+// go:build ignore
 
 // Copyright 2026 The Witness Contributors
 //
@@ -25,9 +25,14 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-/* Pending opens are retained between sys_entry and sys_exit tracepoints.
- * If sys_entry successfully reads the path string, it's stored in path.
- */
+// Pending opens are used to retain state between sys_entry and sys_exit
+// tracepoint functions.
+//
+// State retention between these functions is only required to ensure failed
+// path reads at sys_enter can be retried on sys_exit.
+//
+// Path reads might fail at sys_enter if the pointer hasn't yet been mapped
+// outside of the userspace context.
 struct pending_open {
 	__u64 filename;
 	__s32 dfd;
@@ -42,10 +47,9 @@ struct {
 	__type(value, struct pending_open);
 } pending_opens SEC(".maps");
 
-/* Capture the path as early as possible. Reading user-strings might fail at
- * this stage in which case the original pointer is kept so that it can be tried
- * on syscall exit.
- */
+// Called on sys_enter for open* paths.
+// - Try reading the path.
+// - Store pending_open to be decoded upon sys_exit
 static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	if (!commandrun_in_target_cgroup()) {
 		return 0;
@@ -58,6 +62,9 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	    .error = 0,
 	};
 
+	// Try to read the path buffer as a string on sys_enter for open.
+	// If this fails the pending_open event is marked as such so that it can
+	// be retried at sys_exit.
 	long copied = bpf_probe_read_user_str(pending.path,
 					      sizeof(pending.path), filename);
 	if (copied < 0) {
@@ -75,7 +82,10 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	return 0;
 }
 
-/* Submit the open event after the syscall returns. */
+// Called on sys_exit for open* syscalls.
+// - If pending_open has an error, trying re-reading the path buffer.
+// - Upon success or failure, dispatch an event to the ring buffer to be decoded
+// outside of eBPF in go.
 static __always_inline int submit_pending_open_event(__s64 ret) {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct pending_open *pending =
@@ -103,6 +113,8 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	event->dfd = pending->dfd;
 	event->error = pending->error;
 
+	// If reading the path failed at sys_enter, try that again here.
+	// If this fails as well, return an error event.
 	if (pending->error < 0) {
 		const char *filename = (const char *)pending->filename;
 		long copied = bpf_probe_read_user_str(
@@ -129,7 +141,9 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	return 0;
 }
 
-/* Extract path pointer and CWD before passing it to the map/buffer update functions. */
+/* Register sys_enter and sys_exit programs.
+ *
+ * Decode path pointer and CWD before passing it to util functions. */
 SEC("tracepoint/syscalls/sys_enter_open")
 int trace_open(struct trace_event_raw_sys_enter *ctx) {
 	return save_open_event((const char *)ctx->args[0], AT_FDCWD);

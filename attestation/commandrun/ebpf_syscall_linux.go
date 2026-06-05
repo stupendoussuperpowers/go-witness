@@ -28,6 +28,10 @@ import (
 // sys_entry and sys_exit for open* and exec/exit which emit these events through a shared
 // ring buffer.
 // open* are used for tracking OpenedFiles, exec/exit to track lifecycle events.
+//
+// Args:
+//
+//	cgroupID:	cgroup for "/sys/fs/cgroup/witness-tracing" used to filter for events of interest.
 func loadSyscallEBPFTracer(cgroupID uint64) (*loadedEBPFTracer, error) {
 	spec, err := commandrunbpf.LoadFiletraceSyscall()
 	if err != nil {
@@ -43,8 +47,6 @@ func loadSyscallEBPFTracer(cgroupID uint64) (*loadedEBPFTracer, error) {
 	}
 
 	links := make([]link.Link, 0, 8)
-	// Keep all attach points here so adding/removing syscall coverage is local
-	// to the syscall tracer instead of the shared eBPF runner.
 	for _, tp := range []struct {
 		group   string
 		name    string

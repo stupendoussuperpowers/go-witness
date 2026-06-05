@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	commandRunTraceCgroupPath = "/sys/fs/cgroup/witness-commandrun"
+	commandRunTraceCgroupPath = "/sys/fs/cgroup/witness-tracing"
 	commandRunDigestJobBuffer = 1 << 16
 	commandRunDigestWorkers   = 4
 )
@@ -109,6 +109,7 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 		processes: make(map[int]*ProcessInfo),
 	}
 
+	// Load eBPF tracing programs.
 	var loaded *loadedEBPFTracer
 	switch rc.traceBackend {
 	case TraceBackendEBPF:
