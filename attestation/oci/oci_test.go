@@ -15,14 +15,20 @@
 package oci
 
 import (
+	"archive/tar"
+	"bytes"
 	"crypto"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"testing"
 
 	"github.com/in-toto/go-witness/attestation"
 	"github.com/in-toto/go-witness/cryptoutil"
 	testproducter "github.com/in-toto/go-witness/internal/attestors/test"
+	digest "github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -98,6 +104,185 @@ func TestAttestor_Attest(t *testing.T) {
 	require.Equal(t, manifestDigest, a.ManifestDigest[cryptoutil.DigestValue{Hash: crypto.SHA256}])
 
 	require.NoError(t, err)
+}
+
+func TestAttestor_AttestOCIArchive(t *testing.T) {
+	config := []byte(`{"architecture":"amd64","os":"linux"}`)
+	layer := []byte("oci layer contents")
+
+	configDescriptor := v1.Descriptor{
+		MediaType: v1.MediaTypeImageConfig,
+		Digest:    digest.FromBytes(config),
+		Size:      int64(len(config)),
+	}
+	layerDescriptor := v1.Descriptor{
+		MediaType: v1.MediaTypeImageLayer,
+		Digest:    digest.FromBytes(layer),
+		Size:      int64(len(layer)),
+	}
+	manifest := v1.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: v1.MediaTypeImageManifest,
+		Config:    configDescriptor,
+		Layers:    []v1.Descriptor{layerDescriptor},
+	}
+	manifestRaw, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	manifestDescriptor := v1.Descriptor{
+		MediaType:   v1.MediaTypeImageManifest,
+		Digest:      digest.FromBytes(manifestRaw),
+		Size:        int64(len(manifestRaw)),
+		Annotations: map[string]string{v1.AnnotationRefName: "dtest-img:latest"},
+	}
+	index := v1.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: v1.MediaTypeImageIndex,
+		Manifests: []v1.Descriptor{manifestDescriptor},
+	}
+	indexRaw, err := json.Marshal(index)
+	require.NoError(t, err)
+
+	var archive bytes.Buffer
+	tarWriter := tar.NewWriter(&archive)
+	for name, contents := range map[string][]byte{
+		"index.json": indexRaw,
+		descriptorPathForTest(manifestDescriptor): manifestRaw,
+		descriptorPathForTest(configDescriptor):   config,
+		descriptorPathForTest(layerDescriptor):    layer,
+	} {
+		require.NoError(t, tarWriter.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o600,
+			Size: int64(len(contents)),
+		}))
+		_, err := tarWriter.Write(contents)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tarWriter.Close())
+
+	file, err := os.CreateTemp("", "oci-archive-*.tar")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		file.Close()
+		os.Remove(file.Name())
+	})
+	_, err = file.Write(archive.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	hashes := []cryptoutil.DigestValue{{Hash: crypto.SHA256}}
+	tarDigest, err := cryptoutil.CalculateDigestSetFromBytes(archive.Bytes(), hashes)
+	require.NoError(t, err)
+
+	tp := testproducter.TestProducter{}
+	tp.SetProducts(map[string]attestation.Product{
+		file.Name(): {
+			MimeType: "application/x-tar",
+			Digest:   tarDigest,
+		},
+	})
+
+	a := New()
+	ctx, err := attestation.NewContext("test", []attestation.Attestor{tp, a})
+	require.NoError(t, err)
+	require.NoError(t, ctx.RunAttestors())
+
+	require.Equal(t, manifestDescriptor.Digest.Encoded(), a.ManifestDigest[cryptoutil.DigestValue{Hash: crypto.SHA256}])
+	require.Equal(t, configDescriptor.Digest.Encoded(), a.ImageID[cryptoutil.DigestValue{Hash: crypto.SHA256}])
+	require.Equal(t, layerDescriptor.Digest.Encoded(), a.LayerDiffIDs[0][cryptoutil.DigestValue{Hash: crypto.SHA256}])
+	require.Equal(t, []string{"dtest-img:latest"}, a.ImageTags)
+}
+
+func TestParseOCIManifestNestedIndex(t *testing.T) {
+	configDescriptor := v1.Descriptor{
+		MediaType: v1.MediaTypeImageConfig,
+		Digest:    digest.FromString("config"),
+		Size:      6,
+	}
+	layerDescriptor := v1.Descriptor{
+		MediaType: v1.MediaTypeImageLayer,
+		Digest:    digest.FromString("layer"),
+		Size:      5,
+	}
+	manifest := v1.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: v1.MediaTypeImageManifest,
+		Config:    configDescriptor,
+		Layers:    []v1.Descriptor{layerDescriptor},
+	}
+	manifestRaw, err := json.Marshal(manifest)
+	require.NoError(t, err)
+
+	manifestDescriptor := v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifestRaw),
+		Size:      int64(len(manifestRaw)),
+		Platform:  &v1.Platform{Architecture: "arm64", OS: "linux"},
+	}
+	attestationRaw := []byte(`{"schemaVersion":2}`)
+	attestationDescriptor := v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(attestationRaw),
+		Size:      int64(len(attestationRaw)),
+		Annotations: map[string]string{
+			"vnd.docker.reference.type": "attestation-manifest",
+		},
+		Platform: &v1.Platform{Architecture: "unknown", OS: "unknown"},
+	}
+	nestedIndex := v1.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: v1.MediaTypeImageIndex,
+		Manifests: []v1.Descriptor{manifestDescriptor, attestationDescriptor},
+	}
+	nestedIndexRaw, err := json.Marshal(nestedIndex)
+	require.NoError(t, err)
+
+	nestedIndexDescriptor := v1.Descriptor{
+		MediaType: v1.MediaTypeImageIndex,
+		Digest:    digest.FromBytes(nestedIndexRaw),
+		Size:      int64(len(nestedIndexRaw)),
+		Annotations: map[string]string{
+			"io.containerd.image.name": "docker.io/library/dtest-img:latest",
+			v1.AnnotationRefName:       "latest",
+		},
+	}
+	rootIndex := v1.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: v1.MediaTypeImageIndex,
+		Manifests: []v1.Descriptor{nestedIndexDescriptor},
+	}
+	rootIndexRaw, err := json.Marshal(rootIndex)
+	require.NoError(t, err)
+
+	files := map[string][]byte{
+		descriptorPathForTest(nestedIndexDescriptor): nestedIndexRaw,
+		descriptorPathForTest(manifestDescriptor):    manifestRaw,
+		descriptorPathForTest(attestationDescriptor): attestationRaw,
+	}
+
+	a := New()
+	ctx, err := attestation.NewContext("test", []attestation.Attestor{a})
+	require.NoError(t, err)
+	require.NoError(t, a.parseOCIManifest(ctx, rootIndexRaw, files))
+
+	require.Len(t, a.Manifest, 1)
+	require.Equal(t, descriptorPathForTest(configDescriptor), a.Manifest[0].Config)
+	require.Equal(t, []string{"docker.io/library/dtest-img:latest"}, a.Manifest[0].RepoTags)
+	require.Equal(t, []string{descriptorPathForTest(layerDescriptor)}, a.Manifest[0].Layers)
+	require.Equal(t, manifestRaw, a.ManifestRaw)
+	require.Equal(t, manifestDescriptor.Digest.Encoded(), a.ManifestDigest[cryptoutil.DigestValue{Hash: crypto.SHA256}])
+}
+
+func TestDescriptorPathRejectsEmptyDigest(t *testing.T) {
+	require.NotPanics(t, func() {
+		_, err := descriptorPath(v1.Descriptor{})
+		require.EqualError(t, err, "OCI descriptor has an empty digest")
+	})
+}
+
+func descriptorPathForTest(descriptor v1.Descriptor) string {
+	return "blobs/" + descriptor.Digest.Algorithm().String() + "/" + descriptor.Digest.Encoded()
 }
 
 const (
