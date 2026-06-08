@@ -24,12 +24,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 
 	"github.com/in-toto/go-witness/attestation"
 	"github.com/in-toto/go-witness/cryptoutil"
 	"github.com/in-toto/go-witness/log"
 	"github.com/invopop/jsonschema"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 const (
@@ -148,7 +150,7 @@ func (a *Attestor) Attest(ctx *attestation.AttestationContext) error {
 		return err
 	}
 
-	if err := a.parseMaifest(ctx); err != nil {
+	if err := a.parseManifest(ctx); err != nil {
 		log.Debugf("(attestation/oci) error parsing manifest: %w", err)
 		return err
 	}
@@ -200,14 +202,15 @@ func (a *Attestor) getCandidate(ctx *attestation.AttestationContext) error {
 	return fmt.Errorf("no tar file found")
 }
 
-func (a *Attestor) parseMaifest(ctx *attestation.AttestationContext) error {
+func (a *Attestor) parseManifest(ctx *attestation.AttestationContext) error {
 	f, err := os.Open(a.tarFilePath)
 	if err != nil {
-		err = fmt.Errorf("error opening tar file: %w", err)
-		return err
+		return fmt.Errorf("error opening tar file: %w", err)
 	}
+	defer f.Close()
 
 	tarReader := tar.NewReader(f)
+	files := make(map[string][]byte)
 	for {
 		h, err := tarReader.Next()
 		if err == io.EOF {
@@ -221,15 +224,36 @@ func (a *Attestor) parseMaifest(ctx *attestation.AttestationContext) error {
 		if h.FileInfo().IsDir() {
 			continue
 		}
-		if h.Name == "manifest.json" {
-			a.ManifestRaw = make([]byte, h.Size)
-			_, err = tarReader.Read(a.ManifestRaw)
-			if err != nil || err == io.EOF {
-				break
-			}
-			break
+
+		name := strings.TrimPrefix(path.Clean(h.Name), "./")
+		if name != "manifest.json" && name != "index.json" && !strings.HasPrefix(name, "blobs/") {
+			continue
 		}
+
+		b, err := io.ReadAll(tarReader)
+		if err != nil {
+			return err
+		}
+		files[name] = b
 	}
+
+	if indexRaw, ok := files["index.json"]; ok {
+		log.Info("OCI: Found index.json")
+		return a.parseOCIManifest(ctx, indexRaw, files)
+	}
+
+	manifestRaw, ok := files["manifest.json"]
+	if !ok {
+		return fmt.Errorf("OCI: Product contains neither an index.json nor a manifest.json file")
+	}
+
+	log.Warn("Failed to detect an index.json file, using manifest.json instead")
+	return a.parseDockerManifest(ctx, manifestRaw)
+
+}
+
+func (a *Attestor) parseDockerManifest(ctx *attestation.AttestationContext, manifestRaw []byte) error {
+	a.ManifestRaw = manifestRaw
 
 	manifestDigest, err := cryptoutil.CalculateDigestSetFromBytes(a.ManifestRaw, ctx.Hashes())
 	if err != nil {
@@ -238,12 +262,147 @@ func (a *Attestor) parseMaifest(ctx *attestation.AttestationContext) error {
 
 	a.ManifestDigest = manifestDigest
 
-	err = json.Unmarshal(a.ManifestRaw, &a.Manifest)
-	if err != nil {
+	if err := json.Unmarshal(a.ManifestRaw, &a.Manifest); err != nil {
 		return err
 	}
 
+	if len(a.Manifest) == 0 {
+		return fmt.Errorf("manifest contains no images")
+	}
+
 	return nil
+}
+
+func (a *Attestor) parseOCIManifest(ctx *attestation.AttestationContext, indexRaw []byte, files map[string][]byte) error {
+	type imageManifest struct {
+		manifest Manifest
+		raw      []byte
+	}
+
+	var images []imageManifest
+	visited := make(map[string]struct{})
+
+	var walkIndex func([]byte, []string) error
+	walkIndex = func(raw []byte, inheritedTags []string) error {
+		var index v1.Index
+		if err := json.Unmarshal(raw, &index); err != nil {
+			return fmt.Errorf("error parsing OCI index: %w", err)
+		}
+
+		for _, descriptor := range index.Manifests {
+			descriptorTags := tagsFromDescriptor(descriptor, inheritedTags)
+
+			blobPath, err := descriptorPath(descriptor)
+			if err != nil {
+				return err
+			}
+			if _, ok := visited[blobPath]; ok {
+				continue
+			}
+			visited[blobPath] = struct{}{}
+
+			descriptorRaw, ok := files[blobPath]
+			if !ok {
+				return fmt.Errorf("OCI descriptor blob %s not found", blobPath)
+			}
+
+			switch descriptor.MediaType {
+			case v1.MediaTypeImageIndex:
+				if err := walkIndex(descriptorRaw, descriptorTags); err != nil {
+					return err
+				}
+			case v1.MediaTypeImageManifest:
+				if isAttestationManifest(descriptor) {
+					log.Debugf("(attestation/oci) skipping attestation manifest %s", descriptor.Digest)
+					continue
+				}
+
+				var manifest v1.Manifest
+				if err := json.Unmarshal(descriptorRaw, &manifest); err != nil {
+					return fmt.Errorf("error parsing OCI manifest %s: %w", descriptor.Digest, err)
+				}
+
+				configPath, err := descriptorPath(manifest.Config)
+				if err != nil {
+					return err
+				}
+
+				layerPaths := make([]string, 0, len(manifest.Layers))
+				for _, layer := range manifest.Layers {
+					layerPath, err := descriptorPath(layer)
+					if err != nil {
+						return err
+					}
+					layerPaths = append(layerPaths, layerPath)
+				}
+
+				images = append(images, imageManifest{
+					manifest: Manifest{
+						Config:   configPath,
+						RepoTags: descriptorTags,
+						Layers:   layerPaths,
+					},
+					raw: descriptorRaw,
+				})
+			default:
+				log.Debugf("(attestation/oci) skipping unsupported descriptor media type %q", descriptor.MediaType)
+			}
+		}
+
+		return nil
+	}
+
+	if err := walkIndex(indexRaw, nil); err != nil {
+		return err
+	}
+	if len(images) == 0 {
+		return fmt.Errorf("OCI index contains no runnable image manifests")
+	}
+
+	a.Manifest = make([]Manifest, 0, len(images))
+	for _, image := range images {
+		a.Manifest = append(a.Manifest, image.manifest)
+	}
+
+	// v0.1 has singular raw/digest fields, so the first runnable image remains
+	// the primary image while Manifest reports every runnable image discovered.
+	a.ManifestRaw = images[0].raw
+	manifestDigest, err := cryptoutil.CalculateDigestSetFromBytes(a.ManifestRaw, ctx.Hashes())
+	if err != nil {
+		return err
+	}
+	a.ManifestDigest = manifestDigest
+
+	return nil
+}
+
+func descriptorPath(descriptor v1.Descriptor) (string, error) {
+	if descriptor.Digest == "" {
+		return "", fmt.Errorf("OCI descriptor has an empty digest")
+	}
+	if err := descriptor.Digest.Validate(); err != nil {
+		return "", fmt.Errorf("OCI descriptor has an invalid digest %q: %w", descriptor.Digest, err)
+	}
+
+	algorithm := descriptor.Digest.Algorithm()
+	encoded := descriptor.Digest.Encoded()
+
+	return path.Join("blobs", algorithm.String(), encoded), nil
+}
+
+func tagsFromDescriptor(descriptor v1.Descriptor, inherited []string) []string {
+	if name := descriptor.Annotations["io.containerd.image.name"]; name != "" {
+		return []string{name}
+	}
+	if name := descriptor.Annotations[v1.AnnotationRefName]; name != "" {
+		return []string{name}
+	}
+
+	return append([]string(nil), inherited...)
+}
+
+func isAttestationManifest(descriptor v1.Descriptor) bool {
+	return descriptor.Annotations["vnd.docker.reference.type"] == "attestation-manifest"
 }
 
 func (a *Attestor) Subjects() map[string]cryptoutil.DigestSet {
