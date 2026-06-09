@@ -37,8 +37,9 @@ const (
 // List of supported tracing backends. The CLI provides these through the --trace-backend
 // argument. Default: ptrace.
 const (
-	TraceBackendPtrace = "ptrace"
-	TraceBackendEBPF   = "ebpf"
+	TraceBackendPtrace  = "ptrace"
+	TraceBackendEBPF    = "ebpf"
+	TraceBackendEBPFLSM = "ebpf-lsm"
 )
 
 // This is a hacky way to create a compile time error in case the attestor
@@ -262,7 +263,7 @@ func (rc *CommandRun) validateTraceBackend() error {
 	}
 
 	switch rc.traceBackend {
-	case TraceBackendPtrace, TraceBackendEBPF:
+	case TraceBackendPtrace, TraceBackendEBPF, TraceBackendEBPFLSM:
 		return nil
 	default:
 		return fmt.Errorf("unsupported trace backend %q", rc.traceBackend)

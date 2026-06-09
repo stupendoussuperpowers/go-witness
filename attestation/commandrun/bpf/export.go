@@ -18,7 +18,12 @@ package bpf
 
 import "github.com/cilium/ebpf"
 
+type FiletraceLsmObjects = filetraceLsmObjects
 type FiletraceSyscallObjects = filetraceSyscallObjects
+
+func LoadFiletraceLsm() (*ebpf.CollectionSpec, error) {
+	return loadFiletraceLsm()
+}
 
 func LoadFiletraceSyscall() (*ebpf.CollectionSpec, error) {
 	return loadFiletraceSyscall()
