@@ -31,27 +31,37 @@ func (DockerProvider) Name() string {
 	return "docker"
 }
 
-// Enrich marks workloads that were accepted by the Docker/containerd filters.
-func (DockerProvider) Enrich(_ context.Context, workload *Workload) error {
-	if workload.Metadata == nil {
-		workload.Metadata = make(map[string]string)
+// Enrich labels docker/containerd workloads after collection is complete.
+func (DockerProvider) Enrich(_ context.Context, workloads []Workload) ([]Workload, error) {
+	for i := range workloads {
+		for _, cgroup := range workloads[i].Cgroups {
+			runtime := dockerRuntime(cgroup.Path)
+			if runtime == "" {
+				continue
+			}
+			workloads[i].Runtime = runtime
+			if workloads[i].Metadata == nil {
+				workloads[i].Metadata = make(map[string]string)
+			}
+			workloads[i].Metadata["provider"] = "docker"
+		}
 	}
-	for _, cgroup := range workload.Cgroups {
-		workload.Runtime = dockerRuntime(cgroup.Path)
-	}
-	workload.Metadata["collector.cgroup-file"] = "ebpf"
-	workload.Metadata["provider.docker"] = "matched"
-	return nil
+	return workloads, nil
 }
 
-// CgroupFilter accepts cgroups created by Docker or containerd.
+// These are provider specific filters which mark which mounts/cgroups/file opens
+// are of interest to this specific provider.
 func (DockerProvider) CgroupFilter(cgroupPath string) bool {
 	return dockerRuntime(cgroupPath) != ""
 }
 
-// FileFilter accepts all files under a previously accepted Docker/containerd cgroup.
 func (DockerProvider) FileFilter(_ string) bool {
 	return true
+}
+
+func (DockerProvider) MountFilter(mount Mount) bool {
+	// Reject all mounts for now.
+	return false
 }
 
 func dockerRuntime(cgroupPath string) string {

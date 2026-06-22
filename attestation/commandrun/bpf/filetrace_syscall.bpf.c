@@ -47,6 +47,26 @@ struct {
 	__type(value, struct pending_open);
 } pending_opens SEC(".maps");
 
+static __always_inline void clear_mount_fields(struct file_open_event *event) {
+	event->mount_dev[0] = '\0';
+	event->mount_dir[0] = '\0';
+	event->mount_type[0] = '\0';
+	event->mount_data[0] = '\0';
+	event->mount_flags = 0;
+}
+
+static __always_inline void read_user_str_or_empty(char *dst, __u32 size,
+						   const char *src) {
+	if (!src) {
+		dst[0] = '\0';
+		return;
+	}
+	long copied = bpf_probe_read_user_str(dst, size, src);
+	if (copied < 0) {
+		dst[0] = '\0';
+	}
+}
+
 // Called on sys_enter for open* paths.
 // - Try reading the path.
 // - Store pending_open to be decoded upon sys_exit
@@ -55,7 +75,7 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 		return 0;
 	}
 
-	__u64 pid_tgid = get_ns_pidtgid();
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct pending_open pending = {
 	    .filename = (__u64)filename,
 	    .dfd = dfd,
@@ -85,7 +105,7 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 // - Upon success or failure, dispatch an event to the ring buffer to be decoded
 // outside of eBPF in go.
 static __always_inline int submit_pending_open_event(__s64 ret) {
-	__u64 pid_tgid = get_ns_pidtgid();
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
 
 	// Do not submit failed opens, but remove the state saved on sys_enter.
 	if (ret < 0) {
@@ -113,10 +133,11 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	}
 
 	event->event_type = EVENT_TYPE_OPEN;
-	event->pid = pid_tgid >> 32;
-	event->tid = pid_tgid;
+	set_event_pids(event);
 	event->dfd = pending->dfd;
 	event->error = pending->error;
+	event->cgroup_id = bpf_get_current_cgroup_id();
+	clear_mount_fields(event);
 
 	// If reading the path failed at sys_enter, try that again here.
 	// If this fails as well, return an error event.
@@ -193,12 +214,12 @@ int trace_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	if (!event) {
 		return 0;
 	}
-	__u64 pid_tgid = get_ns_pidtgid();
 	event->event_type = EVENT_TYPE_EXEC;
-	event->pid = pid_tgid >> 32;
-	event->tid = pid_tgid;
+	set_event_pids(event);
 	event->dfd = 0;
 	event->error = 0;
+	event->cgroup_id = bpf_get_current_cgroup_id();
+	clear_mount_fields(event);
 
 	__u16 filename_offset = ctx->__data_loc_filename & 0xffff;
 
@@ -226,13 +247,72 @@ int trace_sched_process_exit(struct trace_event_raw_sys_exit *ctx) {
 	}
 	event->event_type = EVENT_TYPE_EXIT;
 
-	__u64 pid_tgid = get_ns_pidtgid();
-	event->pid = pid_tgid >> 32;
-	event->tid = pid_tgid;
+	set_event_pids(event);
 
 	event->dfd = 0;
 	event->error = 0;
 	event->path[0] = '\0';
+	event->cgroup_id = bpf_get_current_cgroup_id();
+	clear_mount_fields(event);
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint/cgroup/cgroup_mkdir")
+int trace_cgroup_mkdir(struct trace_event_raw_cgroup *ctx) {
+	struct file_open_event *event =
+	    bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event) {
+		return 0;
+	}
+
+	event->event_type = EVENT_TYPE_CGROUP_MKDIR;
+	set_event_pids(event);
+	event->dfd = 0;
+	event->error = 0;
+	event->cgroup_id = ctx->id;
+	clear_mount_fields(event);
+
+	__u16 path_offset = ctx->__data_loc_path & 0xffff;
+	long copied = bpf_probe_read_kernel_str(
+	    event->path, sizeof(event->path), (void *)ctx + path_offset);
+	if (copied < 0) {
+		event->path[0] = '\0';
+	}
+
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_mount")
+int trace_mount(struct trace_event_raw_sys_enter *ctx) {
+	if (!commandrun_in_target_cgroup()) {
+		return 0;
+	}
+
+	struct file_open_event *event =
+	    bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event) {
+		return 0;
+	}
+
+	event->event_type = EVENT_TYPE_MOUNT;
+	set_event_pids(event);
+	event->dfd = 0;
+	event->error = 0;
+	event->path[0] = '\0';
+	event->cgroup_id = bpf_get_current_cgroup_id();
+	event->mount_flags = (__u64)ctx->args[3];
+
+	read_user_str_or_empty(event->mount_dev, sizeof(event->mount_dev),
+			       (const char *)ctx->args[0]);
+	read_user_str_or_empty(event->mount_dir, sizeof(event->mount_dir),
+			       (const char *)ctx->args[1]);
+	read_user_str_or_empty(event->mount_type, sizeof(event->mount_type),
+			       (const char *)ctx->args[2]);
+	read_user_str_or_empty(event->mount_data, sizeof(event->mount_data),
+			       (const char *)ctx->args[4]);
+
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }

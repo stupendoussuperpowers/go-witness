@@ -15,13 +15,19 @@
 #ifndef WITNESS_COMMANDRUN_FILETRACE_COMMON_H
 #define WITNESS_COMMANDRUN_FILETRACE_COMMON_H
 
-/* Set by Go before load. Every program uses it to ignore processes outside the
- * command-run cgroup, which keeps witness' own file activity out of the output.
- */
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include "vmlinux.h"
-volatile const __u64 target_cgroup_id = 0;
+
+/* Cgroup allowlist populated by userspace. Every program uses it to ignore
+ * processes outside the cgroups being traced.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);
+	__type(value, __u8);
+} target_cgroups SEC(".maps");
 
 /* Shared ring-buffer payload consumed by ebpf_linux.go. Keep this layout in
  * sync with fileOpenEvent on the Go side.
@@ -30,9 +36,17 @@ struct file_open_event {
 	__u32 event_type;
 	__u32 pid;
 	__u32 tid;
+	__u32 host_pid;
+	__u32 host_tid;
 	__s32 dfd;
 	__s64 error;
 	char path[256];
+	__u64 cgroup_id;
+	char mount_dev[256];
+	char mount_dir[256];
+	char mount_type[64];
+	char mount_data[256];
+	__u64 mount_flags;
 };
 
 enum event_type {
@@ -40,6 +54,8 @@ enum event_type {
 	EVENT_TYPE_EXEC = 2,
 	EVENT_TYPE_EXIT = 3,
 	EVENT_TYPE_ERROR = 4,
+	EVENT_TYPE_CGROUP_MKDIR = 5,
+	EVENT_TYPE_MOUNT = 6,
 };
 
 enum error_type {
@@ -64,10 +80,9 @@ struct {
 } events SEC(".maps");
 
 static __always_inline int commandrun_in_target_cgroup() {
-	if (target_cgroup_id == 0) {
-		return 0;
-	}
-	return bpf_get_current_cgroup_id() == target_cgroup_id;
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
+	__u8 *enabled = bpf_map_lookup_elem(&target_cgroups, &cgroup_id);
+	return enabled != 0;
 }
 
 /* Return the current task's TGID/TID as seen from its innermost PID namespace,
@@ -93,6 +108,16 @@ static __always_inline __u64 get_ns_pidtgid(void) {
 	return ((__u64)tgid << 32) | tid;
 }
 
+static __always_inline void set_event_pids(struct file_open_event *event) {
+	__u64 ns_pid_tgid = get_ns_pidtgid();
+	__u64 host_pid_tgid = bpf_get_current_pid_tgid();
+
+	event->pid = ns_pid_tgid >> 32;
+	event->tid = ns_pid_tgid;
+	event->host_pid = host_pid_tgid >> 32;
+	event->host_tid = host_pid_tgid;
+}
+
 /* Internal failures are stored as special Error events so that the buffer-draining
  * code can fail the attestor. This ensures that we do not silently swallow errors
  * that might cause the attestor to be incomplete.
@@ -108,13 +133,17 @@ static __always_inline void submit_error_event(__s64 error) {
 		return;
 	}
 
-	__u64 pid_tgid = get_ns_pidtgid();
 	event->event_type = EVENT_TYPE_ERROR;
-	event->pid = pid_tgid >> 32;
-	event->tid = pid_tgid;
+	set_event_pids(event);
 	event->dfd = 0;
 	event->error = error;
 	event->path[0] = '\0';
+	event->cgroup_id = bpf_get_current_cgroup_id();
+	event->mount_dev[0] = '\0';
+	event->mount_dir[0] = '\0';
+	event->mount_type[0] = '\0';
+	event->mount_data[0] = '\0';
+	event->mount_flags = 0;
 	bpf_ringbuf_submit(event, 0);
 }
 

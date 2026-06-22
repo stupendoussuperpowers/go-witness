@@ -42,6 +42,7 @@ const (
 	eventTypeExit        = 3
 	eventTypeError       = 4
 	eventTypeCgroupMkdir = 5
+	eventTypeMount       = 6
 )
 
 const (
@@ -55,15 +56,20 @@ const (
 )
 
 type cgroupFileEvent struct {
-	EventType uint32
-	PID       uint32
-	TID       uint32
-	HostPID   uint32
-	HostTID   uint32
-	Dfd       int32
-	Error     int64
-	Path      [256]byte
-	CgroupID  uint64
+	EventType  uint32
+	PID        uint32
+	TID        uint32
+	HostPID    uint32
+	HostTID    uint32
+	Dfd        int32
+	Error      int64
+	Path       [256]byte
+	CgroupID   uint64
+	MountDev   [256]byte
+	MountDir   [256]byte
+	MountType  [64]byte
+	MountData  [256]byte
+	MountFlags uint64
 }
 
 type CgroupFileDetector struct {
@@ -186,9 +192,11 @@ func (c *CgroupFileDetector) readEvents(ctx context.Context, attestor *Attestor)
 
 		switch event.EventType {
 		case eventTypeCgroupMkdir:
-			c.handleCgroupMkdir(ctx, attestor, event)
+			c.handleCgroupMkdir(attestor, event)
 		case eventTypeOpen:
 			c.handleOpen(attestor, event)
+		case eventTypeMount:
+			c.handleMount(attestor, event)
 		case eventTypeExec, eventTypeExit:
 			c.handleProcess(attestor, event)
 		}
@@ -196,7 +204,7 @@ func (c *CgroupFileDetector) readEvents(ctx context.Context, attestor *Attestor)
 }
 
 // handleCgroupMkdir accepts provider-matched cgroups and adds them to the BPF allowlist.
-func (c *CgroupFileDetector) handleCgroupMkdir(ctx context.Context, attestor *Attestor, event cgroupFileEvent) {
+func (c *CgroupFileDetector) handleCgroupMkdir(attestor *Attestor, event cgroupFileEvent) {
 	path := cleanCString(event.Path[:])
 	if path == "" || event.CgroupID == 0 || !attestor.AcceptCgroup(path) {
 		log.Infof("(%s) ignored cgroup mkdir: id=%d path=%s", Name, event.CgroupID, path)
@@ -214,7 +222,7 @@ func (c *CgroupFileDetector) handleCgroupMkdir(ctx context.Context, attestor *At
 	c.mu.Unlock()
 
 	log.Infof("(%s) tracking cgroup: id=%d path=%s", Name, cgroup.ID, cgroup.Path)
-	attestor.AddCgroup(ctx, cgroup)
+	attestor.AddCgroup(cgroup)
 }
 
 // handleOpen resolves accepted open events to paths and schedules digesting.
@@ -236,6 +244,33 @@ func (c *CgroupFileDetector) handleOpen(attestor *Attestor, event cgroupFileEven
 	attestor.AddProcess(cgroup, processInfo(int(event.PID), int(event.HostPID)))
 	attestor.AddOpenedFile(cgroup, openPath, nil)
 	c.enqueueDigestJob(cgroupFileDigestJob{cgroup: cgroup, path: openPath})
+}
+
+// handleMount records accepted mount events under the cgroup that emitted them.
+func (c *CgroupFileDetector) handleMount(attestor *Attestor, event cgroupFileEvent) {
+	cgroup, ok := c.cgroup(event.CgroupID)
+	if !ok {
+		return
+	}
+
+	mount := Mount{
+		Device:     cleanCString(event.MountDev[:]),
+		Directory:  cleanCString(event.MountDir[:]),
+		Type:       cleanCString(event.MountType[:]),
+		Data:       cleanCString(event.MountData[:]),
+		Flags:      event.MountFlags,
+		ProcessID:  int(event.PID),
+		HostPID:    int(event.HostPID),
+		HostTID:    int(event.HostTID),
+		CgroupID:   event.CgroupID,
+		CgroupPath: cgroup.Path,
+	}
+	if mount.Directory == "" || !attestor.AcceptMount(mount) {
+		return
+	}
+
+	attestor.AddProcess(cgroup, processInfo(int(event.PID), int(event.HostPID)))
+	attestor.AddMount(cgroup, mount)
 }
 
 func (c *CgroupFileDetector) enqueueDigestJob(job cgroupFileDigestJob) {
@@ -309,7 +344,7 @@ func loadCgroupFileTracer() (*loadedCgroupFileTracer, error) {
 		return nil, fmt.Errorf("load objects: %w", err)
 	}
 
-	links := make([]link.Link, 0, 9)
+	links := make([]link.Link, 0, 10)
 	for _, tp := range []struct {
 		group    string
 		name     string
@@ -325,6 +360,7 @@ func loadCgroupFileTracer() (*loadedCgroupFileTracer, error) {
 		{"sched", "sched_process_exec", objs.TraceSchedProcessExec, true},
 		{"sched", "sched_process_exit", objs.TraceSchedProcessExit, true},
 		{"cgroup", "cgroup_mkdir", objs.TraceCgroupMkdir, true},
+		{"syscalls", "sys_enter_mount", objs.TraceMount, true},
 	} {
 		l, err := link.Tracepoint(tp.group, tp.name, tp.program, nil)
 		if err != nil {

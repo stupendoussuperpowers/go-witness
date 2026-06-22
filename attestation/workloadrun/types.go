@@ -45,6 +45,7 @@ type Workload struct {
 	Name        string                          `json:"name,omitempty"`
 	Image       string                          `json:"image,omitempty"`
 	Cgroups     []Cgroup                        `json:"cgroups,omitempty"`
+	Mounts      []Mount                         `json:"mounts,omitempty"`
 	Processes   []ProcessInfo                   `json:"processes,omitempty"`
 	OpenedFiles map[string]cryptoutil.DigestSet `json:"openedfiles,omitempty"`
 	Metadata    map[string]string               `json:"metadata,omitempty"`
@@ -53,6 +54,19 @@ type Workload struct {
 type Cgroup struct {
 	ID   uint64 `json:"id,omitempty"`
 	Path string `json:"path,omitempty"`
+}
+
+type Mount struct {
+	Device     string `json:"device,omitempty"`
+	Directory  string `json:"directory,omitempty"`
+	Type       string `json:"type,omitempty"`
+	Data       string `json:"data,omitempty"`
+	Flags      uint64 `json:"flags,omitempty"`
+	ProcessID  int    `json:"processid,omitempty"`
+	HostPID    int    `json:"hostpid,omitempty"`
+	HostTID    int    `json:"hosttid,omitempty"`
+	CgroupID   uint64 `json:"cgroupid,omitempty"`
+	CgroupPath string `json:"cgrouppath,omitempty"`
 }
 
 type ProcessInfo struct {

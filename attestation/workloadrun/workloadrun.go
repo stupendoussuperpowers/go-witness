@@ -63,12 +63,13 @@ func init() {
 type Option func(*Attestor)
 
 // Provider decides which detected workload events are relevant and may add
-// provider-specific metadata to a workload.
+// provider-specific metadata or grouping after collection is complete.
 type Provider interface {
 	Name() string
 	CgroupFilter(cgroup string) bool
 	FileFilter(files string) bool
-	Enrich(ctx context.Context, workload *Workload) error
+	MountFilter(mount Mount) bool
+	Enrich(ctx context.Context, workloads []Workload) ([]Workload, error)
 }
 
 type ProviderFactory func() Provider
@@ -94,7 +95,6 @@ func New(opts ...Option) *Attestor {
 		detector:  NewCgroupFileDetector(),
 		providers: []Provider{DockerProvider{}},
 	}
-
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -165,6 +165,22 @@ func (a *Attestor) Attest(ctx *attestation.AttestationContext) error {
 		return ctx.Context().Err()
 	}
 
+	a.mu.Lock()
+	workloads := append([]Workload(nil), a.WorkloadRun.Workloads...)
+	a.mu.Unlock()
+
+	var err error
+	for _, provider := range a.providers {
+		workloads, err = provider.Enrich(ctx.Context(), workloads)
+		if err != nil {
+			return fmt.Errorf("provider %q enrich workloads: %w", provider.Name(), err)
+		}
+	}
+
+	a.mu.Lock()
+	a.WorkloadRun.Workloads = workloads
+	a.mu.Unlock()
+
 	return nil
 }
 
@@ -226,6 +242,7 @@ func (a *Attestor) AcceptCgroup(path string) bool {
 			return true
 		}
 	}
+	log.Debugf("Excluding cgroup: %s", path)
 	return false
 }
 
@@ -239,9 +256,20 @@ func (a *Attestor) AcceptFile(path string) bool {
 	return false
 }
 
-// AddCgroup creates or updates the workload associated with a detected cgroup.
-func (a *Attestor) AddCgroup(ctx context.Context, cgroup Cgroup) {
-	a.updateWorkload(ctx, workloadID(cgroup), func(workload *Workload) {
+// AcceptMount returns true when at least one provider wants this mount event.
+func (a *Attestor) AcceptMount(mount Mount) bool {
+	for _, provider := range a.providers {
+		if provider.MountFilter(mount) {
+			return true
+		}
+	}
+	log.Debugf("Excluding mount: %s", mount.Directory)
+	return false
+}
+
+// AddCgroup creates one default workload for each detected cgroup.
+func (a *Attestor) AddCgroup(cgroup Cgroup) {
+	a.updateWorkload(workloadID(cgroup), func(workload *Workload) {
 		workload.Kind = "cgroup"
 
 		for _, item := range workload.Cgroups {
@@ -254,9 +282,21 @@ func (a *Attestor) AddCgroup(ctx context.Context, cgroup Cgroup) {
 	})
 }
 
+// AddMount records a mount event under the cgroup workload that emitted it.
+func (a *Attestor) AddMount(cgroup Cgroup, mount Mount) {
+	a.updateWorkload(workloadID(cgroup), func(workload *Workload) {
+		for _, item := range workload.Mounts {
+			if item == mount {
+				return
+			}
+		}
+		workload.Mounts = append(workload.Mounts, mount)
+	})
+}
+
 // AddProcess records process metadata under the cgroup workload.
 func (a *Attestor) AddProcess(cgroup Cgroup, process ProcessInfo) {
-	a.updateWorkload(context.Background(), workloadID(cgroup), func(workload *Workload) {
+	a.updateWorkload(workloadID(cgroup), func(workload *Workload) {
 		for _, item := range workload.Processes {
 			if item.ProcessID == process.ProcessID {
 				return
@@ -269,7 +309,7 @@ func (a *Attestor) AddProcess(cgroup Cgroup, process ProcessInfo) {
 
 // AddOpenedFile records a path immediately, then upgrades it with a digest later.
 func (a *Attestor) AddOpenedFile(cgroup Cgroup, path string, digest cryptoutil.DigestSet) {
-	a.updateWorkload(context.Background(), workloadID(cgroup), func(workload *Workload) {
+	a.updateWorkload(workloadID(cgroup), func(workload *Workload) {
 		if workload.OpenedFiles == nil {
 			workload.OpenedFiles = make(map[string]cryptoutil.DigestSet)
 		}
@@ -280,7 +320,7 @@ func (a *Attestor) AddOpenedFile(cgroup Cgroup, path string, digest cryptoutil.D
 	})
 }
 
-func (a *Attestor) updateWorkload(ctx context.Context, id string, update func(*Workload)) {
+func (a *Attestor) updateWorkload(id string, update func(*Workload)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -288,14 +328,6 @@ func (a *Attestor) updateWorkload(ctx context.Context, id string, update func(*W
 	if update != nil {
 		update(workload)
 	}
-
-	/*
-		for _, provider := range a.providers {
-			if err := provider.Enrich(ctx, workload); err != nil {
-				log.Debugf("(%s) provider %q enrich workload %q: %v", Name, provider.Name(), id, err)
-			}
-		}
-	*/
 }
 
 func (a *Attestor) workloadLocked(id string) *Workload {
