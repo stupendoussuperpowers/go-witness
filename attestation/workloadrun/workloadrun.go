@@ -17,6 +17,7 @@ package workloadrun
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -85,7 +86,10 @@ func WithProviderNames(names ...string) Option {
 				a.optionErrors = append(a.optionErrors, fmt.Errorf("workload provider %q is not registered", name))
 				continue
 			}
-			a.providers = append(a.providers, factory())
+
+			if !slices.Contains(a.providers, factory()) {
+				a.providers = append(a.providers, factory())
+			}
 		}
 	}
 }
