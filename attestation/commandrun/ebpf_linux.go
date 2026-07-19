@@ -66,6 +66,8 @@ type fileOpenEvent struct {
 	MountType  [64]byte
 	MountData  [256]byte
 	MountFlags uint64
+	pid        int
+	path       string
 }
 
 // loadedEBPFTracer is the generic contract between a BPF backend and this
@@ -140,12 +142,12 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	case TraceBackendEBPF:
 		loaded, err = loadSyscallEBPFTracer(cgroupID)
 	default:
-		return nil, fmt.Errorf("Unknown EBPF backend: %s", rc.traceBackend)
+		return nil, fmt.Errorf("unknown EBPF backend: %s", rc.traceBackend)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load command-run eBPF file tracer: %w", err)
 	}
-	defer loaded.close()
+	defer func() { _ = loaded.close() }()
 
 	log.Infof("Using tracer: %s for command-run", rc.traceBackend)
 
@@ -180,7 +182,14 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 		reader.Close()
 		readerWg.Wait()
 		pctx.finishDigestWorkers()
+		if hasPreExit {
+			_ = rc.executeHooks.RunHooks(attestation.StagePreExit, c.Process.Pid)
+		}
 		return nil, err
+	}
+
+	if hasPreExit {
+		defer func() { _ = rc.executeHooks.RunHooks(attestation.StagePreExit, c.Process.Pid) }()
 	}
 
 	pctx.mu.Lock()
@@ -271,6 +280,7 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 
 			if path != "" {
 				openPath := resolveOpenPath(int(event.HostTID), int(event.Dfd), path)
+				// openPath := resolveOpenPath(int(event.PID), int(event.Dfd), path)
 				if _, exists := procInfo.OpenedFiles[openPath]; !exists {
 					procInfo.OpenedFiles[openPath] = nil
 					digestPath = openPath
@@ -299,12 +309,14 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			// Digest calculation can block on disk I/O. Queue it after the
 			// event update so the ring-buffer reader keeps moving.
 			p.enqueueDigestJob(digestJob{pid: pid, path: digestPath, digestPath: digestPath})
+			// p.enqueueDigestJob(digestJob{pid: pid, path: digestPath})
 		}
 
 		if shouldEnrich {
 			// /proc enrichment is attestation-schema work, not BPF plumbing.
 			// Keep it out of the locked event update path.
 			p.populateMetadataForProc(pid, int(event.HostPID), event.EventType == eventTypeExec)
+			// p.populateMetadataForProc(pid, event.EventType == eventTypeExec)
 		}
 
 		if exitedPID != 0 {
@@ -364,6 +376,7 @@ func cleanCString(data []byte) string {
 func resolveOpenPath(pid, dfd int, path string) string {
 	if filepath.IsAbs(path) {
 		return filepath.Join(fmt.Sprintf("/proc/%d/root", pid), strings.TrimPrefix(path, "/"))
+		// return path
 	}
 
 	procPath := fmt.Sprintf("/proc/%d/fd/%d", pid, dfd)
@@ -418,6 +431,7 @@ func (p *ebpfTraceContext) digestWorker() {
 	defer p.digestWg.Done()
 	for job := range p.digestJobs {
 		digest, err := cryptoutil.CalculateDigestSetFromFile(job.digestPath, p.hash)
+		// digest, err := cryptoutil.CalculateDigestSetFromFile(job.path, p.hash)
 		if err != nil {
 			continue
 		}

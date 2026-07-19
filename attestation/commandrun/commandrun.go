@@ -25,6 +25,7 @@ import (
 
 	"github.com/in-toto/go-witness/attestation"
 	"github.com/in-toto/go-witness/cryptoutil"
+	"github.com/in-toto/go-witness/registry"
 	"github.com/invopop/jsonschema"
 )
 
@@ -61,7 +62,21 @@ type CommandRunAttestor interface {
 func init() {
 	attestation.RegisterAttestation(Name, Type, RunType, func() attestation.Attestor {
 		return New()
-	})
+	},
+		registry.StringConfigOption[attestation.Attestor](
+			"trace-backend",
+			"Tracing backend to use for command-run opened file capture. Supported values: default, ebpf",
+			TraceBackendDefault,
+			func(a attestation.Attestor, backend string) (attestation.Attestor, error) {
+				commandRun, ok := a.(*CommandRun)
+				if !ok {
+					return a, fmt.Errorf("unexpected attestor type: %T is not a command-run attestor", a)
+				}
+				WithTraceBackend(backend)(commandRun)
+				return commandRun, nil
+			},
+		),
+	)
 }
 
 type Option func(*CommandRun)
@@ -239,7 +254,22 @@ func (rc *CommandRun) runCmd(ctx *attestation.AttestationContext) error {
 		rc.Processes, err = rc.traceWithEBPF(c, ctx, hasPreExec, hasPreExit)
 	} else {
 		if err := c.Start(); err != nil {
+
+			// Ensure cooperating attestors blocked on PreExit are released even
+			// when the process never started. RunHooks is idempotent per stage.
+			if hasPreExit {
+				_ = rc.executeHooks.RunHooks(attestation.StagePreExit, 0)
+			}
 			return err
+		}
+
+		// Safety net: guarantee PreExit hooks run exactly once for this command,
+		// regardless of which execution path is taken or how it returns. The tracer
+		// normally runs PreExit at the precise moment the process is exiting; this
+		// deferred call (idempotent via RunHooks) covers any early-return/error
+		// path so cooperating attestors (e.g. networktrace) never strand.
+		if hasPreExit {
+			defer func() { _ = rc.executeHooks.RunHooks(attestation.StagePreExit, c.Process.Pid) }()
 		}
 
 		if rc.enableTracing {

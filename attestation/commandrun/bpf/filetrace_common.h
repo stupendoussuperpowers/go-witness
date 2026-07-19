@@ -144,6 +144,9 @@ static __always_inline void submit_error_event(__s64 error) {
 	event->mount_type[0] = '\0';
 	event->mount_data[0] = '\0';
 	event->mount_flags = 0;
+	__u64 pid_tgid = get_ns_pidtgid();
+	event->pid = pid_tgid >> 32;
+	event->tid = pid_tgid;
 	bpf_ringbuf_submit(event, 0);
 }
 

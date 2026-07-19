@@ -1,4 +1,4 @@
-// go:build ignore
+//go:build ignore
 
 // Copyright 2026 The Witness Contributors
 //
@@ -75,7 +75,7 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 		return 0;
 	}
 
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 pid_tgid = get_ns_pidtgid();
 	struct pending_open pending = {
 	    .filename = (__u64)filename,
 	    .dfd = dfd,
@@ -105,7 +105,7 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 // - Upon success or failure, dispatch an event to the ring buffer to be decoded
 // outside of eBPF in go.
 static __always_inline int submit_pending_open_event(__s64 ret) {
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 pid_tgid = get_ns_pidtgid();
 
 	// Do not submit failed opens, but remove the state saved on sys_enter.
 	if (ret < 0) {
@@ -135,9 +135,12 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	event->event_type = EVENT_TYPE_OPEN;
 	set_event_pids(event);
 	event->dfd = pending->dfd;
-	event->error = pending->error;
 	event->cgroup_id = bpf_get_current_cgroup_id();
 	clear_mount_fields(event);
+	event->pid = pid_tgid >> 32;
+	event->tid = pid_tgid;
+	event->dfd = pending->dfd;
+	event->error = pending->error;
 
 	// If reading the path failed at sys_enter, try that again here.
 	// If this fails as well, return an error event.
@@ -214,12 +217,16 @@ int trace_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	if (!event) {
 		return 0;
 	}
+	
 	event->event_type = EVENT_TYPE_EXEC;
 	set_event_pids(event);
 	event->dfd = 0;
 	event->error = 0;
 	event->cgroup_id = bpf_get_current_cgroup_id();
 	clear_mount_fields(event);
+	__u64 pid_tgid = get_ns_pidtgid();
+	event->pid = pid_tgid >> 32;
+	event->tid = pid_tgid;
 
 	__u16 filename_offset = ctx->__data_loc_filename & 0xffff;
 
@@ -248,7 +255,9 @@ int trace_sched_process_exit(struct trace_event_raw_sys_exit *ctx) {
 	event->event_type = EVENT_TYPE_EXIT;
 
 	set_event_pids(event);
-
+	__u64 pid_tgid = get_ns_pidtgid();
+	event->pid = pid_tgid >> 32;
+	event->tid = pid_tgid;
 	event->dfd = 0;
 	event->error = 0;
 	event->path[0] = '\0';
