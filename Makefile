@@ -43,6 +43,8 @@ check-aws-certs: ## Check the AWS public keys used to verify AWS IID documents
 	GOWORK=off go run -C ./attestation/aws-iid/check-certs/ . ../aws-certs.go
 
 VMLINUX_H := ./attestation/bpf-common/headers/vmlinux.h
+BPF_HELPERS_H ?= /usr/include/bpf/bpf_helpers.h
+BPF_TARGETS ?= bpfel,bpfeb
 
 .PHONY: generate-vmlinux
 generate-vmlinux: $(VMLINUX_H)
@@ -52,17 +54,21 @@ $(VMLINUX_H):
 	@command -v bpftool >/dev/null 2>&1 || { echo "Error: bpftool is required. Install with: apt install linux-tools-common linux-tools-$(uname -r)"; exit 1; }
 	mkdir -p ./attestation/bpf-common/headers && bpftool btf dump file /sys/kernel/btf/vmlinux format c > ./attestation/bpf-common/headers/vmlinux.h
 
+.PHONY: check-bpf-headers
+check-bpf-headers:
+	@test -f "$(BPF_HELPERS_H)" || { echo "Error: libbpf headers are required at $(BPF_HELPERS_H). Install with: apt install libbpf-dev"; exit 1; }
+
 .PHONY: generate-commandrun-bpf
-generate-commandrun-bpf: generate-vmlinux ## Generate BPF bytecode and Go bindings for command-run file tracing
+generate-commandrun-bpf: generate-vmlinux check-bpf-headers ## Generate BPF bytecode and Go bindings for command-run file tracing
 	@echo "Generating command-run BPF code (requires clang and llvm)..."
 	go generate -tags linux ./attestation/commandrun/bpf/...
 
 .PHONY: generate-networktrace-bpf
-generate-networktrace-bpf: generate-vmlinux ## Generate BPF bytecode and Go bindings for network trace attestor
+generate-networktrace-bpf: generate-vmlinux check-bpf-headers ## Generate BPF bytecode and Go bindings for network trace attestor
 	@echo "Generating BPF code (requires clang and llvm)..."
-	go generate ./attestation/networktrace/bpf/...
+	BPF_TARGETS="$(BPF_TARGETS)" go generate ./attestation/networktrace/bpf/...
 
 .PHONY: generate-networktrace-bpf-debug
-generate-networktrace-bpf-debug: generate-vmlinux ## Generate networktrace BPF bytecode with debug logging enabled
+generate-networktrace-bpf-debug: generate-vmlinux check-bpf-headers ## Generate networktrace BPF bytecode with debug logging enabled
 	@echo "Generating BPF code with DEBUG logging (requires clang and llvm)..."
-	BPF_CFLAGS="-DBPF_DEBUG" go generate ./attestation/networktrace/bpf/...
+	BPF_TARGETS="$(BPF_TARGETS)" BPF_CFLAGS="-DBPF_DEBUG" go generate ./attestation/networktrace/bpf/...
