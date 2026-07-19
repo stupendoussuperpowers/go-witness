@@ -44,7 +44,7 @@ check-aws-certs: ## Check the AWS public keys used to verify AWS IID documents
 
 VMLINUX_H := ./attestation/bpf-common/headers/vmlinux.h
 BPF_HELPERS_H ?= /usr/include/bpf/bpf_helpers.h
-BPF_TARGETS ?= bpfel,bpfeb
+BPF_TARGETS ?= bpfel
 
 .PHONY: generate-vmlinux
 generate-vmlinux: $(VMLINUX_H)
