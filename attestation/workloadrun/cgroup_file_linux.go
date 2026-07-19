@@ -185,7 +185,12 @@ func (c *CgroupFileDetector) readEvents(ctx context.Context, attestor *Attestor)
 			return
 		}
 		if event.EventType == eventTypeError {
-			c.readErr = formatCgroupFileTraceError(event)
+			err := formatCgroupFileTraceError(event)
+			if event.Error == errorTypePendingOpenMissing {
+				log.Warnf("(%s) cgroup-file reader: %v", Name, err)
+				continue
+			}
+			c.readErr = err
 			log.Infof("(%s) cgroup-file reader: %v", Name, c.readErr)
 			return
 		}
