@@ -23,9 +23,6 @@
 #include "headers/map_defs.h"
 #include "headers/helpers.h"
 
-extern struct task_struct* bpf_task_from_pid(pid_t pid) __ksym;
-extern void bpf_task_release(struct task_struct* task) __ksym;
-
 // Handle sched_process_fork tracepoint
 // When a process forks, if the parent is in tid_allowlist with nested_allowed,
 // add the child to tid_allowlist as well
@@ -45,25 +42,15 @@ int handle_sched_process_fork(struct trace_event_raw_sched_process_fork* ctx) {
     struct tid_allowlist_val* parent_val = bpf_map_lookup_elem(&tid_allowlist, &parent_key);
     DEBUG_LOG("fork: parent_in_allowlist=%d nested=%d", parent_val != NULL, parent_val ? parent_val->nested_allowed : 0);
     if (parent_val && parent_val->nested_allowed) {
-        // Get child's task struct using KFunc (kernel 6.12+)
-        struct task_struct* child = bpf_task_from_pid(ctx->child_pid);
-        if (!child) return 0;
-        
-        __u32 child_tid = get_tid_ns(child);
-        
         struct tid_allowlist_key child_key = {
-            .tid = child_tid,
+            .tid = ctx->child_pid,
         };
         struct tid_allowlist_val child_val = {
             .nested_allowed = parent_val->nested_allowed,
         };
         bpf_map_update_elem(&tid_allowlist, &child_key, &child_val, BPF_ANY);
         
-        DEBUG_LOG("fork: child_tid=%d ADDED to tid_allowlist", child_tid);
-        
-        // From bpf docs:
-        // If a task is returned, it must either be stored in a map, or released with bpf_task_release().
-        bpf_task_release(child);
+        DEBUG_LOG("fork: child_tid=%d ADDED to tid_allowlist", ctx->child_pid);
     }
 
     return 0;
