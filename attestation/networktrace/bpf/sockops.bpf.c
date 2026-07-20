@@ -95,8 +95,8 @@ int tcp_sockops(struct bpf_sock_ops* skops) {
                     LOG("sockops: ERROR ACTIVE_EST map_update pid=%d ret=%d",
                         pid, ret);
                 } else {
-                    LOG("sockops: ACTIVE_EST pid=%d comm=%s dst=%x:%d", pid,
-                        comm, tkey.remote_ip, tkey.remote_port);
+                    // LOG("sockops: ACTIVE_EST pid=%d comm=%s dst=%x:%d", pid,
+                    //    comm, tkey.remote_ip, tkey.remote_port);
                 }
             } else if (family == AF_INET6) {
                 // Store 4-tuple -> client cookie mapping (IPv6)
