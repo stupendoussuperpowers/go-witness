@@ -79,7 +79,7 @@ int handle_sched_process_fork(struct trace_event_raw_sched_process_fork* ctx) {
 // Handle sched_process_exit tracepoint
 // Remove TID from allowlist when process exits
 SEC("tracepoint/sched/sched_process_exit")
-int handle_sched_process_exit(struct trace_event_raw_sched_process_exit* ctx) {
+int handle_sched_process_exit(void* ctx) {
     struct task_struct* task = (struct task_struct*)bpf_get_current_task();
     __u32 tid = get_tid_ns(task);
 
