@@ -510,6 +510,14 @@ func (p *ebpfTraceContext) digestOne(job digestJob) {
 
 	digest, err := cryptoutil.CalculateDigestSetFromFile(job.path, p.hash)
 	if err != nil {
+		if errors.Is(err, cryptoutil.ErrNotHashable) {
+			// The path is not a regular file (e.g. FIFO, socket, etc.) and therefore not build evidence.
+			p.mu.Lock()
+			if procInfo := p.processes[job.pid]; procInfo != nil {
+				delete(procInfo.OpenedFiles, job.path)
+			}
+			p.mu.Unlock()
+		}
 		log.Debugf("command-run: skipping digest for %q (pid %d): %v", job.path, job.pid, err)
 		return
 	}
