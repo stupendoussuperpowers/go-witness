@@ -130,6 +130,7 @@ type ptraceContext struct {
 	traceePid           int
 	mainProgram         string
 	processes           map[int]*ProcessInfo
+	tgidOf              map[int]int // TID -> TGID/PID map
 	exitCode            int
 	hash                []cryptoutil.DigestValue
 	environmentCapturer *environment.Capture
@@ -169,6 +170,7 @@ func (rc *CommandRun) traceWithOptions(c *exec.Cmd, actx *attestation.Attestatio
 		traceePid:    c.Process.Pid,
 		mainProgram:  c.Path,
 		processes:    make(map[int]*ProcessInfo),
+		tgidOf:       map[int]int{c.Process.Pid: c.Process.Pid},
 		executeHooks: rc.executeHooks,
 		hooksOnly:    hooksOnly,
 		hasPreExec:   hasPreExec,
@@ -407,12 +409,23 @@ func (p *ptraceContext) runTrace() error {
 					injectedSig = 0
 
 					switch eventCode {
-					case unix.PTRACE_EVENT_CLONE, unix.PTRACE_EVENT_FORK, unix.PTRACE_EVENT_VFORK:
+					case unix.PTRACE_EVENT_CLONE:
+						// A new thread of an existing process.
 						newTIDMsg, _ := unix.PtraceGetEventMsg(pid)
 						newTID := int(newTIDMsg)
 						if _, known := trackedTIDs[newTID]; !known {
 							trackedTIDs[newTID] = struct{}{}
 						}
+						p.tgidOf[newTID] = p.tgidFor(pid)
+					case unix.PTRACE_EVENT_FORK, unix.PTRACE_EVENT_VFORK:
+						// New process
+						newTIDMsg, _ := unix.PtraceGetEventMsg(pid)
+						newTID := int(newTIDMsg)
+						if _, known := trackedTIDs[newTID]; !known {
+							trackedTIDs[newTID] = struct{}{}
+						}
+						p.tgidOf[newTID] = newTID
+						p.getProcInfo(newTID).ParentPID = p.tgidFor(pid)
 					case unix.PTRACE_EVENT_EXEC:
 						oldTID, err := unix.PtraceGetEventMsg(pid)
 						if err == nil {
@@ -758,9 +771,10 @@ func (p *ptraceContext) handleSyscall(pid int, regs unix.PtraceRegs) error {
 		statusFile, err := os.ReadFile(status)
 		if err == nil {
 			procInfo.SpecBypassIsVuln = getSpecBypassIsVulnFromStatus(statusFile)
-			ppid, err := getPPIDFromStatus(statusFile)
-			if err == nil {
-				procInfo.ParentPID = ppid
+			if procInfo.ParentPID == 0 {
+				if ppid, err := getPPIDFromStatus(statusFile); err == nil {
+					procInfo.ParentPID = ppid
+				}
 			}
 		}
 
@@ -822,15 +836,24 @@ func (p *ptraceContext) handleSyscall(pid int, regs unix.PtraceRegs) error {
 	return nil
 }
 
+// tgidFor returns the thread-group (process) id owning pid.
+func (ctx *ptraceContext) tgidFor(pid int) int {
+	if tgid, ok := ctx.tgidOf[pid]; ok {
+		return tgid
+	}
+	return pid
+}
+
 func (ctx *ptraceContext) getProcInfo(pid int) *ProcessInfo {
-	procInfo, ok := ctx.processes[pid]
+	tgid := ctx.tgidFor(pid)
+	procInfo, ok := ctx.processes[tgid]
 	if !ok {
 		procInfo = &ProcessInfo{
-			ProcessID:   pid,
+			ProcessID:   tgid,
 			OpenedFiles: make(map[string]cryptoutil.DigestSet),
 		}
 
-		ctx.processes[pid] = procInfo
+		ctx.processes[tgid] = procInfo
 	}
 
 	return procInfo
