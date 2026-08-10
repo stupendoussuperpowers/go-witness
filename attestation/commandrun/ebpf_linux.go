@@ -299,8 +299,7 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 
 		switch event.EventType {
 		case eventTypeOpen:
-			pid = int(event.HostTID)
-			procInfo = p.getProcInfo(pid, int(event.TID))
+			procInfo = p.getProcInfo(pid, int(event.PID))
 			procInfo.CgroupID = event.CgroupID
 
 			path := cleanCString(event.Path[:])
@@ -360,7 +359,9 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			p.populateMetadataForProc(pid, event.EventType == eventTypeExec)
 		}
 
-		if exitedPID != 0 {
+		if exitedPID != 0 && !processHasLiveThreads(exitedPID) {
+			// sched_process_exit fires per task, don't mark PID as exited
+			// if a task is still alive.
 			p.mu.Lock()
 			p.exited[exitedPID] = struct{}{}
 			p.mu.Unlock()
@@ -372,6 +373,14 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 			}
 		}
 	}
+}
+
+func processHasLiveThreads(pid int) bool {
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		return false
+	}
+	return len(entries) > 0
 }
 
 // Waits until one of exitNotify, readerDone, or a 5-second timer are awake.
@@ -404,6 +413,17 @@ func (p *ebpfTraceContext) waitForExit(pid int, readerDone <-chan struct{}) bool
 			return false
 		}
 	}
+}
+
+// parseCgroupPath extracts the cgroup v2 path from /proc/<pid>/cgroup
+// Fallback for processes in pre-existing cgroups.
+func parseCgroupPath(data []byte) string {
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if rest, found := strings.CutPrefix(line, "0::"); found {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
 }
 
 func cleanCString(data []byte) string {
@@ -511,6 +531,7 @@ func (p *ebpfTraceContext) digestOne(job digestJob) {
 	digest, err := cryptoutil.CalculateDigestSetFromFile(job.path, p.hash)
 	if err != nil {
 		if errors.Is(err, cryptoutil.ErrNotHashable) {
+			log.Debugf("command-run: Removing unhashable file: %s", job.path)
 			// The path is not a regular file (e.g. FIFO, socket, etc.) and therefore not build evidence.
 			p.mu.Lock()
 			if procInfo := p.processes[job.pid]; procInfo != nil {
@@ -572,7 +593,9 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 		if procInfo.Program == "" && procInfo.Comm != "" && !strings.Contains(procInfo.Comm, " ") {
 			procInfo.Program = procInfo.Comm
 		}
-		procInfo.CgroupPath = p.cgroupPaths[procInfo.CgroupID]
+		if path := p.cgroupPaths[procInfo.CgroupID]; path != "" {
+			procInfo.CgroupPath = path
+		}
 		processes = append(processes, *procInfo)
 	}
 
@@ -585,6 +608,8 @@ func (p *ebpfTraceContext) populateMetadataForProc(pid int, overwrite bool) {
 	statusBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 	cmdlineBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	exePath, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	cgroupBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	cgroupPath := parseCgroupPath(cgroupBytes)
 
 	var ppid int
 	if len(statusBytes) > 0 {
@@ -632,6 +657,9 @@ func (p *ebpfTraceContext) populateMetadataForProc(pid int, overwrite bool) {
 	}
 	if (overwrite || procInfo.Program == "") && exePath != "" {
 		procInfo.Program = exePath
+	}
+	if procInfo.CgroupPath == "" && cgroupPath != "" {
+		procInfo.CgroupPath = cgroupPath
 	}
 	if (overwrite || procInfo.ExeDigest == nil) && exeDigest != nil {
 		procInfo.ExeDigest = exeDigest

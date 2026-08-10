@@ -194,6 +194,10 @@ type ProcessInfo struct {
 	Program          string                          `json:"program,omitempty"`
 	ProcessID        int                             `json:"processid"`
 	ParentPID        int                             `json:"parentpid"`
+	HostProcessID    int                             `json:"hostprocessid,omitempty"`
+	CgroupID         uint64                          `json:"cgroupid,omitempty"`
+	CgroupPath       string                          `json:"cgrouppath,omitempty"`
+	Mounts           []Mount                         `json:"mounts,omitempty"`
 	ProgramDigest    cryptoutil.DigestSet            `json:"programdigest,omitempty"`
 	Comm             string                          `json:"comm,omitempty"`
 	Cmdline          string                          `json:"cmdline,omitempty"`
@@ -201,10 +205,6 @@ type ProcessInfo struct {
 	OpenedFiles      map[string]cryptoutil.DigestSet `json:"openedfiles,omitempty"`
 	Environ          string                          `json:"environ,omitempty"`
 	SpecBypassIsVuln bool                            `json:"specbypassisvuln,omitempty"`
-	HostProcessID    int                             `json:"hostprocessid,omitempty"`
-	CgroupID         uint64                          `json:"cgroupid,omitempty"`
-	CgroupPath       string                          `json:"cgrouppath,omitempty"`
-	Mounts           []Mount                         `json:"mounts,omitempty"`
 }
 
 type Mount struct {
