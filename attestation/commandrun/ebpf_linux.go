@@ -165,6 +165,14 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 	}
 	defer func() { _ = loaded.close() }()
 
+	// Populate information for daemon PIDs since we don't see an EVENT_TYPE_EXEC for these.
+	for _, pid := range rc.daemonPIDs {
+		pctx.mu.Lock()
+		pctx.getProcInfo(pid, pid)
+		pctx.mu.Unlock()
+		pctx.populateMetadataForProc(pid, true)
+	}
+
 	log.Infof("Using tracer: %s for command-run", rc.traceBackend)
 
 	// Start the ring buffer reader before the command starts so short-lived
