@@ -24,7 +24,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -53,19 +52,17 @@ type digestJob struct {
 }
 
 type fileOpenEvent struct {
-	EventType  uint32
-	PID        uint32
-	TID        uint32
-	Dfd        int32
-	Error      int64
-	HostPID    uint32
-	HostTID    uint32
-	CgroupID   uint64
-	Path       [4096]byte
-	MountDev   [4096]byte
-	MountType  [4096]byte
-	MountData  [4096]byte
-	MountFlags uint64
+	EventType uint32
+	PID       uint32
+	TID       uint32
+	Dfd       int32
+	Error     int64
+	HostPID   uint32
+	HostTID   uint32
+	CgroupID  uint64
+	HostPPID  uint32
+	_         uint32
+	Path      [4096]byte
 }
 
 // loadedEBPFTracer is the generic contract between a BPF backend and this
@@ -104,7 +101,6 @@ const (
 	eventTypeExit        = 3
 	eventTypeError       = 4
 	eventTypeCgroupMkdir = 5
-	eventTypeMount       = 6
 )
 
 const (
@@ -337,20 +333,10 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 				shouldEnrich = true
 			}
 			exitedPID = pid
+		}
 
-		case eventTypeMount:
-			procInfo = p.getProcInfo(pid, int(event.PID))
-			procInfo.CgroupID = event.CgroupID
-			mount := Mount{
-				Device:    cleanCString(event.MountDev[:]),
-				Directory: cleanCString(event.Path[:]),
-				Type:      cleanCString(event.MountType[:]),
-				Data:      cleanCString(event.MountData[:]),
-				Flags:     event.MountFlags,
-			}
-			if mount.Directory != "" && !slices.Contains(procInfo.Mounts, mount) {
-				procInfo.Mounts = append(procInfo.Mounts, mount)
-			}
+		if procInfo != nil && procInfo.ParentPID == 0 {
+			procInfo.ParentPID = int(event.HostPPID)
 		}
 
 		p.mu.Unlock()

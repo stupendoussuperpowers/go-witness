@@ -282,36 +282,3 @@ int trace_cgroup_mkdir(struct trace_event_raw_cgroup *ctx) {
 	return 0;
 }
 
-/* Track new mounts, useful for snap BuildKit etc. in order to properly
- * determine which file to hash*/
-SEC("tracepoint/syscalls/sys_enter_mount")
-int trace_mount(struct trace_event_raw_sys_enter *ctx) {
-	if (!commandrun_should_trace()) {
-		return 0;
-	}
-
-	struct file_open_event *event =
-	    bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-	if (!event) {
-		return 0;
-	}
-
-	event->event_type = EVENT_TYPE_MOUNT;
-	set_event_pids(event);
-	event->cgroup_id = bpf_get_current_cgroup_id();
-	event->dfd = 0;
-	event->error = 0;
-	event->mount_flags = (__u64)ctx->args[3];
-
-	read_user_str_or_empty(event->path, sizeof(event->path),
-			       (const char *)ctx->args[1]);
-	read_user_str_or_empty(event->mount_dev, sizeof(event->mount_dev),
-			       (const char *)ctx->args[0]);
-	read_user_str_or_empty(event->mount_type, sizeof(event->mount_type),
-			       (const char *)ctx->args[2]);
-	read_user_str_or_empty(event->mount_data, sizeof(event->mount_data),
-			       (const char *)ctx->args[4]);
-
-	bpf_ringbuf_submit(event, 0);
-	return 0;
-}

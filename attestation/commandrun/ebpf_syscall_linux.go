@@ -58,7 +58,6 @@ func loadSyscallEBPFTracer(cgroupID uint64, trackCgroup bool, daemonPIDs []int) 
 		{"syscalls", "sys_exit_openat2", objs.TraceOpenat2Exit, false},
 		{"sched", "sched_process_exec", objs.TraceSchedProcessExec, true},
 		{"sched", "sched_process_exit", objs.TraceSchedProcessExit, true},
-		{"syscalls", "sys_enter_mount", objs.TraceMount, true},
 	}
 
 	// Cgroup programs

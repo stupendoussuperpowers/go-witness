@@ -49,11 +49,9 @@ struct file_open_event {
 	__u32 host_pid;
 	__u32 host_tid;
 	__u64 cgroup_id;
+	__u32 host_ppid;
+	__u32 padding; // Padding
 	char path[4096];
-	char mount_dev[4096];
-	char mount_type[4096];
-	char mount_data[4096];
-	__u64 mount_flags;
 };
 
 enum event_type {
@@ -62,7 +60,6 @@ enum event_type {
 	EVENT_TYPE_EXIT = 3,
 	EVENT_TYPE_ERROR = 4,
 	EVENT_TYPE_CGROUP_MKDIR = 5,
-	EVENT_TYPE_MOUNT = 6,
 };
 
 enum error_type {
@@ -144,8 +141,8 @@ static __always_inline __u64 get_ns_pidtgid(void) {
 	return ((__u64)tgid << 32) | tid;
 }
 
-/* Populates both the namespace-local and host-real pid/tid pairs on an
- * event. Used for /proc/<pid>/... paths that require host-pids.
+/* Populates both the namespace-local and host-real PID/TID pairs and host PPID on an
+ * event.
  */
 static __always_inline void set_event_pids(struct file_open_event *event) {
 	__u64 ns_pid_tgid = get_ns_pidtgid();
@@ -155,19 +152,10 @@ static __always_inline void set_event_pids(struct file_open_event *event) {
 	event->tid = ns_pid_tgid;
 	event->host_pid = host_pid_tgid >> 32;
 	event->host_tid = host_pid_tgid;
-}
 
-/* Best-effort read of a mount string argument, any of which may be NULL
- * (e.g. data is commonly NULL, and some filesystems don't need a source).
- */
-static __always_inline void read_user_str_or_empty(char *dst, __u32 size, const char *src) {
-	if (!src) {
-		dst[0] = '\0';
-		return;
-	}
-	if (bpf_probe_read_user_str(dst, size, src) < 0) {
-		dst[0] = '\0';
-	}
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+	event->host_ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 }
 
 /* Internal failures are stored as special Error events so that the buffer-draining

@@ -67,7 +67,6 @@ type filetraceSyscallSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type filetraceSyscallProgramSpecs struct {
 	TraceCgroupMkdir      *ebpf.ProgramSpec `ebpf:"trace_cgroup_mkdir"`
-	TraceMount            *ebpf.ProgramSpec `ebpf:"trace_mount"`
 	TraceOpen             *ebpf.ProgramSpec `ebpf:"trace_open"`
 	TraceOpenExit         *ebpf.ProgramSpec `ebpf:"trace_open_exit"`
 	TraceOpenat           *ebpf.ProgramSpec `ebpf:"trace_openat"`
@@ -140,7 +139,6 @@ type filetraceSyscallVariables struct {
 // It can be passed to loadFiletraceSyscallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type filetraceSyscallPrograms struct {
 	TraceCgroupMkdir      *ebpf.Program `ebpf:"trace_cgroup_mkdir"`
-	TraceMount            *ebpf.Program `ebpf:"trace_mount"`
 	TraceOpen             *ebpf.Program `ebpf:"trace_open"`
 	TraceOpenExit         *ebpf.Program `ebpf:"trace_open_exit"`
 	TraceOpenat           *ebpf.Program `ebpf:"trace_openat"`
@@ -154,7 +152,6 @@ type filetraceSyscallPrograms struct {
 func (p *filetraceSyscallPrograms) Close() error {
 	return _FiletraceSyscallClose(
 		p.TraceCgroupMkdir,
-		p.TraceMount,
 		p.TraceOpen,
 		p.TraceOpenExit,
 		p.TraceOpenat,
