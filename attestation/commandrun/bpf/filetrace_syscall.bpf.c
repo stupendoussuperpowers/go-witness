@@ -48,6 +48,18 @@ struct {
 	__type(value, struct pending_open);
 } pending_opens SEC(".maps");
 
+static __always_inline void read_user_str_or_empty(char *dst, __u32 size,
+						   const char *src) {
+	if (!src) {
+		dst[0] = '\0';
+		return;
+	}
+	long copied = bpf_probe_read_user_str(dst, size, src);
+	if (copied < 0) {
+		dst[0] = '\0';
+	}
+}
+
 // Called on sys_enter for open* paths.
 // - Try reading the path.
 // - Store pending_open to be decoded upon sys_exit
@@ -65,8 +77,8 @@ static __always_inline int save_open_event(const char *filename, __s32 dfd) {
 	};
 
 	// Try to read the path buffer as a string on sys_enter for open.
-	// If this fails (or is truncated) the pending_open event is marked as such so that it can
-	// be retried at sys_exit.
+	// If this fails (or is truncated) the pending_open event is marked as
+	// such so that it can be retried at sys_exit.
 	long copied = bpf_probe_read_user_str(pending.path,
 					      sizeof(pending.path), filename);
 	if (copied < 0) {
@@ -121,6 +133,7 @@ static __always_inline int submit_pending_open_event(__s64 ret) {
 	event->event_type = EVENT_TYPE_OPEN;
 	set_event_pids(event);
 	event->cgroup_id = bpf_get_current_cgroup_id();
+	clear_mount_fields(event);
 	event->dfd = pending->dfd;
 	event->error = pending->error;
 
@@ -204,6 +217,7 @@ int trace_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 	event->event_type = EVENT_TYPE_EXEC;
 	set_event_pids(event);
 	event->cgroup_id = bpf_get_current_cgroup_id();
+	clear_mount_fields(event);
 	event->dfd = 0;
 	event->error = 0;
 
@@ -234,6 +248,7 @@ int trace_sched_process_exit(struct trace_event_raw_sys_exit *ctx) {
 	event->event_type = EVENT_TYPE_EXIT;
 	set_event_pids(event);
 	event->cgroup_id = bpf_get_current_cgroup_id();
+	clear_mount_fields(event);
 
 	event->dfd = 0;
 	event->error = 0;
@@ -250,8 +265,8 @@ int trace_cgroup_mkdir(struct trace_event_raw_cgroup *ctx) {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = pid_tgid >> 32;
 
-	// If the PID creating this cgroup exists in our maps as a process of interest
-	// store the cgroup in target_cgroups.
+	// If the PID creating this cgroup exists in our maps as a process of
+	// interest store the cgroup in target_cgroups.
 	if (!bpf_map_lookup_elem(&daemon_tasks, &tgid)) {
 		return 0;
 	}
@@ -268,6 +283,7 @@ int trace_cgroup_mkdir(struct trace_event_raw_cgroup *ctx) {
 	event->event_type = EVENT_TYPE_CGROUP_MKDIR;
 	set_event_pids(event);
 	event->cgroup_id = cgroup_id;
+	clear_mount_fields(event);
 	event->dfd = 0;
 	event->error = 0;
 
@@ -282,3 +298,35 @@ int trace_cgroup_mkdir(struct trace_event_raw_cgroup *ctx) {
 	return 0;
 }
 
+SEC("tracepoint/syscalls/sys_enter_mount")
+int trace_mount(struct trace_event_raw_sys_enter *ctx) {
+	if (!commandrun_should_trace()) {
+		return 0;
+	}
+
+	struct file_open_event *event =
+	    bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event) {
+		return 0;
+	}
+
+	event->event_type = EVENT_TYPE_MOUNT;
+	set_event_pids(event);
+	event->cgroup_id = bpf_get_current_cgroup_id();
+	event->dfd = 0;
+	event->error = 0;
+	event->path[0] = '\0';
+	event->mount_flags = (__u64)ctx->args[3];
+
+	read_user_str_or_empty(event->mount_dev, sizeof(event->mount_dev),
+			       (const char *)ctx->args[0]);
+	read_user_str_or_empty(event->mount_dir, sizeof(event->mount_dir),
+			       (const char *)ctx->args[1]);
+	read_user_str_or_empty(event->mount_type, sizeof(event->mount_type),
+			       (const char *)ctx->args[2]);
+	read_user_str_or_empty(event->mount_data, sizeof(event->mount_data),
+			       (const char *)ctx->args[4]);
+
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}

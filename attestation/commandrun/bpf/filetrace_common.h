@@ -44,14 +44,19 @@ struct file_open_event {
 	__u32 event_type;
 	__u32 pid;
 	__u32 tid;
-	__s32 dfd;
-	__s64 error;
 	__u32 host_pid;
 	__u32 host_tid;
+	__s32 dfd;
+	__s64 error;
 	__u64 cgroup_id;
 	__u32 host_ppid;
 	__u32 padding; // Padding
 	char path[4096];
+	char mount_dev[256];
+	char mount_dir[256];
+	char mount_type[64];
+	char mount_data[256];
+	__u64 mount_flags;
 };
 
 enum event_type {
@@ -60,6 +65,7 @@ enum event_type {
 	EVENT_TYPE_EXIT = 3,
 	EVENT_TYPE_ERROR = 4,
 	EVENT_TYPE_CGROUP_MKDIR = 5,
+	EVENT_TYPE_MOUNT = 6,
 };
 
 enum error_type {
@@ -158,6 +164,14 @@ static __always_inline void set_event_pids(struct file_open_event *event) {
 	event->host_ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 }
 
+static __always_inline void clear_mount_fields(struct file_open_event *event) {
+	event->mount_dev[0] = '\0';
+	event->mount_dir[0] = '\0';
+	event->mount_type[0] = '\0';
+	event->mount_data[0] = '\0';
+	event->mount_flags = 0;
+}
+
 /* Internal failures are stored as special Error events so that the buffer-draining
  * code can fail the attestor. This ensures that we do not silently swallow errors
  * that might cause the attestor to be incomplete.
@@ -179,6 +193,7 @@ static __always_inline void submit_error_event(__s64 error) {
 	event->dfd = 0;
 	event->error = error;
 	event->path[0] = '\0';
+	clear_mount_fields(event);
 	bpf_ringbuf_submit(event, 0);
 }
 

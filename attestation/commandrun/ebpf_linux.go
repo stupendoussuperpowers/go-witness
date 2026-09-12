@@ -47,22 +47,28 @@ const (
 )
 
 type digestJob struct {
-	pid  int
-	path string
+	pid        int
+	path       string
+	digestPath string
 }
 
 type fileOpenEvent struct {
-	EventType uint32
-	PID       uint32
-	TID       uint32
-	Dfd       int32
-	Error     int64
-	HostPID   uint32
-	HostTID   uint32
-	CgroupID  uint64
-	HostPPID  uint32
-	_         uint32
-	Path      [4096]byte
+	EventType  uint32
+	PID        uint32
+	TID        uint32
+	HostPID    uint32
+	HostTID    uint32
+	Dfd        int32
+	Error      int64
+	CgroupID   uint64
+	HostPPID   uint32
+	_          uint32
+	Path       [4096]byte
+	MountDev   [256]byte
+	MountDir   [256]byte
+	MountType  [64]byte
+	MountData  [256]byte
+	MountFlags uint64
 }
 
 // loadedEBPFTracer is the generic contract between a BPF backend and this
@@ -101,6 +107,7 @@ const (
 	eventTypeExit        = 3
 	eventTypeError       = 4
 	eventTypeCgroupMkdir = 5
+	eventTypeMount       = 6
 )
 
 const (
@@ -166,7 +173,7 @@ func (rc *CommandRun) traceWithEBPF(c *exec.Cmd, actx *attestation.AttestationCo
 		pctx.mu.Lock()
 		pctx.getProcInfo(pid, pid)
 		pctx.mu.Unlock()
-		pctx.populateMetadataForProc(pid, true)
+		pctx.populateMetadataForProc(pid, pid, true)
 	}
 
 	log.Infof("Using tracer: %s for command-run", rc.traceBackend)
@@ -333,6 +340,10 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 				shouldEnrich = true
 			}
 			exitedPID = pid
+		case eventTypeMount:
+			log.Debugf("command-run: pid %d mounted %q (%s) at %q flags=0x%x",
+				pid, cleanCString(event.MountDev[:]), cleanCString(event.MountType[:]),
+				cleanCString(event.MountDir[:]), event.MountFlags)
 		}
 
 		if procInfo != nil && procInfo.ParentPID == 0 {
@@ -344,13 +355,13 @@ func (p *ebpfTraceContext) readEvents(reader *ringbuf.Reader) error {
 		if digestPath != "" {
 			// Digest calculation can block on disk I/O. Queue it after the
 			// event update so the ring-buffer reader keeps moving.
-			p.enqueueDigestJob(digestJob{pid: pid, path: digestPath})
+			p.enqueueDigestJob(digestJob{pid: pid, path: digestPath, digestPath: digestPath})
 		}
 
 		if shouldEnrich {
 			// /proc enrichment is attestation-schema work, not BPF plumbing.
 			// Keep it out of the locked event update path.
-			p.populateMetadataForProc(pid, event.EventType == eventTypeExec)
+			p.populateMetadataForProc(pid, int(event.HostPID), event.EventType == eventTypeExec)
 		}
 
 		if exitedPID != 0 && !processHasLiveThreads(exitedPID) {
@@ -595,11 +606,14 @@ func (p *ebpfTraceContext) procInfoArray() []ProcessInfo {
 
 // Enrich ProcessInfo from /proc. These reads are best
 // effort because exec/exit events can race with process teardown.
-func (p *ebpfTraceContext) populateMetadataForProc(pid int, overwrite bool) {
-	statusBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	cmdlineBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	exePath, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-	cgroupBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+func (p *ebpfTraceContext) populateMetadataForProc(pid, hostPID int, overwrite bool) {
+	if hostPID <= 0 {
+		hostPID = pid
+	}
+	statusBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", hostPID))
+	cmdlineBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", hostPID))
+	exePath, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", hostPID))
+	cgroupBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", hostPID))
 	cgroupPath := parseCgroupPath(cgroupBytes)
 
 	var ppid int
